@@ -1,0 +1,762 @@
+# AutoHaul shared-memory layout: the single source of truth.
+#
+# `python tools/gen_layout.py` turns this file (plus inputs.toml) into
+#   native/bridge/generated/autohaul_layout.h   (C structs + static_asserts + channel/config tables)
+#   autohaul/io/_layout.py                      (ctypes structures + the same tables)
+# Bump `version` on any incompatible change. A hash of both spec files is embedded in the
+# shared memory header, so a DLL/Python mismatch is detected at connect time.
+#
+# Field types: u8 u16 u32 u64 s32 s64 f32 f64, char[N], <type>[N], or a struct name (optionally [N]).
+# N may be a literal or a constant from [constants].
+
+version = 1
+
+[constants]
+RING_SLOTS = 8          # telemetry frames kept in the ring
+EVENT_SLOTS = 64        # gameplay event ring
+MAX_WHEELS = 16
+MAX_TRAILERS = 4
+MAX_FORWARD_GEARS = 32
+MAX_REVERSE_GEARS = 8
+CHANNEL_SEEN_WORDS = 4  # 256 bits: one per registered channel id
+MAX_EXTRA_KILL_VK = 8
+
+[names]
+telemetry_mapping = 'Local\AutoHaul_Telemetry'
+controls_mapping = 'Local\AutoHaul_Controls'
+frame_event = 'Local\AutoHaul_Frame'
+telemetry_magic = 0x4C544841   # "AHTL"
+controls_magic = 0x54434841    # "AHCT"
+
+# ---------------------------------------------------------------- common
+
+[[struct]]
+name = "Vec3"
+fields = [["x", "f32"], ["y", "f32"], ["z", "f32"]]
+
+[[struct]]
+name = "DPlacement"      # world position (metres) + orientation (SDK unit angles)
+fields = [
+  ["x", "f64"], ["y", "f64"], ["z", "f64"],
+  ["heading", "f32"], ["pitch", "f32"], ["roll", "f32"], ["_pad", "u32"],
+]
+
+[[struct]]
+name = "FPlacement"
+fields = [
+  ["x", "f32"], ["y", "f32"], ["z", "f32"],
+  ["heading", "f32"], ["pitch", "f32"], ["roll", "f32"],
+]
+
+# ---------------------------------------------------------------- telemetry frame
+
+[[struct]]
+name = "TrailerFrame"
+fields = [
+  ["placement", "DPlacement"],
+  ["local_linear_velocity", "Vec3"],
+  ["local_angular_velocity", "Vec3"],
+  ["local_linear_acceleration", "Vec3"],
+  ["local_angular_acceleration", "Vec3"],
+  ["cargo_damage", "f32"],
+  ["wear_body", "f32"],
+  ["wear_chassis", "f32"],
+  ["wear_wheels", "f32"],
+  ["connected", "u8"],
+  ["_pad", "u8[3]"],
+]
+
+[[struct]]
+name = "TelemetryFrame"
+fields = [
+  ["seq_begin", "u64"],
+  ["frame_index", "u64"],               # telemetry frames since the DLL loaded
+  ["publish_qpc", "u64"],               # QueryPerformanceCounter at frame_end
+  ["render_time_us", "u64"],
+  ["simulation_time_us", "u64"],
+  ["paused_simulation_time_us", "u64"],
+  ["frame_flags", "u32"],
+  ["paused", "u32"],
+  ["game_time", "u32"],                 # in-game minutes since day 0 00:00
+  ["next_rest_stop", "s32"],            # in-game minutes
+  ["next_mandatory_break", "s32"],      # in-game minutes (not available on 1.53)
+  ["multiplayer_time_offset", "s32"],
+  ["local_scale", "f32"],
+  ["_pad0", "u32"],
+  ["truck_placement", "DPlacement"],
+  ["local_linear_velocity", "Vec3"],
+  ["local_angular_velocity", "Vec3"],
+  ["local_linear_acceleration", "Vec3"],
+  ["local_angular_acceleration", "Vec3"],
+  ["cabin_offset", "FPlacement"],
+  ["head_offset", "FPlacement"],
+  ["speed", "f32"],                     # m/s, negative when reversing
+  ["engine_rpm", "f32"],
+  ["engine_gear", "s32"],
+  ["displayed_gear", "s32"],
+  ["input_steering", "f32"],            # counterclockwise positive (SDK convention)
+  ["input_throttle", "f32"],
+  ["input_brake", "f32"],
+  ["input_clutch", "f32"],
+  ["effective_steering", "f32"],
+  ["effective_throttle", "f32"],
+  ["effective_brake", "f32"],
+  ["effective_clutch", "f32"],
+  ["cruise_control", "f32"],            # m/s, 0 = off
+  ["hshifter_slot", "u32"],
+  ["retarder_level", "u32"],
+  ["brake_air_pressure", "f32"],
+  ["brake_temperature", "f32"],
+  ["fuel", "f32"],
+  ["fuel_average_consumption", "f32"],
+  ["fuel_range", "f32"],                # km
+  ["adblue", "f32"],
+  ["adblue_average_consumption", "f32"],
+  ["oil_pressure", "f32"],
+  ["oil_temperature", "f32"],
+  ["water_temperature", "f32"],
+  ["battery_voltage", "f32"],
+  ["dashboard_backlight", "f32"],
+  ["light_aux_front", "u32"],
+  ["light_aux_roof", "u32"],
+  ["wear_engine", "f32"],
+  ["wear_transmission", "f32"],
+  ["wear_cabin", "f32"],
+  ["wear_chassis", "f32"],
+  ["wear_wheels", "f32"],
+  ["odometer", "f32"],                  # km
+  ["navigation_distance", "f32"],       # m
+  ["navigation_time", "f32"],           # s
+  ["navigation_speed_limit", "f32"],    # m/s
+  ["job_cargo_damage", "f32"],
+  ["parking_brake", "u8"],
+  ["motor_brake", "u8"],
+  ["air_pressure_warning", "u8"],
+  ["air_pressure_emergency", "u8"],
+  ["fuel_warning", "u8"],
+  ["adblue_warning", "u8"],
+  ["oil_pressure_warning", "u8"],
+  ["water_temperature_warning", "u8"],
+  ["battery_voltage_warning", "u8"],
+  ["electric_enabled", "u8"],
+  ["engine_enabled", "u8"],
+  ["lblinker", "u8"],
+  ["rblinker", "u8"],
+  ["hazard_warning", "u8"],
+  ["light_lblinker", "u8"],
+  ["light_rblinker", "u8"],
+  ["light_parking", "u8"],
+  ["light_low_beam", "u8"],
+  ["light_high_beam", "u8"],
+  ["light_beacon", "u8"],
+  ["light_brake", "u8"],
+  ["light_reverse", "u8"],
+  ["wipers", "u8"],
+  ["differential_lock", "u8"],
+  ["lift_axle", "u8"],
+  ["lift_axle_indicator", "u8"],
+  ["trailer_lift_axle", "u8"],
+  ["trailer_lift_axle_indicator", "u8"],
+  ["wheel_steering", "f32[MAX_WHEELS]"],        # SDK unit angle, per wheel
+  ["wheel_velocity", "f32[MAX_WHEELS]"],        # rotations per second
+  ["wheel_susp_deflection", "f32[MAX_WHEELS]"],
+  ["wheel_on_ground", "u8[MAX_WHEELS]"],
+  ["trailers", "TrailerFrame[MAX_TRAILERS]"],
+  ["channel_seen", "u64[CHANNEL_SEEN_WORDS]"],   # bit per channel id: received at least once
+  ["seq_end", "u64"],
+]
+
+# ---------------------------------------------------------------- configuration
+
+[[struct]]
+name = "TruckConfig"
+fields = [
+  ["seq", "u32"], ["present", "u8"], ["_pad", "u8[3]"],
+  ["brand_id", "char[64]"], ["brand", "char[64]"], ["id", "char[64]"], ["name", "char[64]"],
+  ["license_plate", "char[32]"], ["license_plate_country_id", "char[32]"],
+  ["fuel_capacity", "f32"], ["fuel_warning_factor", "f32"],
+  ["adblue_capacity", "f32"], ["adblue_warning_factor", "f32"],
+  ["air_pressure_warning", "f32"], ["air_pressure_emergency", "f32"],
+  ["oil_pressure_warning", "f32"], ["water_temperature_warning", "f32"], ["battery_voltage_warning", "f32"],
+  ["rpm_limit", "f32"],
+  ["forward_gear_count", "u32"], ["reverse_gear_count", "u32"], ["retarder_step_count", "u32"],
+  ["differential_ratio", "f32"],
+  ["forward_ratio", "f32[MAX_FORWARD_GEARS]"],
+  ["reverse_ratio", "f32[MAX_REVERSE_GEARS]"],
+  ["cabin_position", "Vec3"], ["head_position", "Vec3"], ["hook_position", "Vec3"],
+  ["wheel_count", "u32"],
+  ["wheel_position", "Vec3[MAX_WHEELS]"],
+  ["wheel_radius", "f32[MAX_WHEELS]"],
+  ["wheel_steerable", "u8[MAX_WHEELS]"], ["wheel_simulated", "u8[MAX_WHEELS]"],
+  ["wheel_powered", "u8[MAX_WHEELS]"], ["wheel_liftable", "u8[MAX_WHEELS]"],
+]
+
+[[struct]]
+name = "TrailerConfig"
+fields = [
+  ["seq", "u32"], ["present", "u8"], ["_pad", "u8[3]"],
+  ["id", "char[64]"], ["cargo_accessory_id", "char[64]"], ["brand_id", "char[64]"], ["brand", "char[64]"],
+  ["name", "char[64]"], ["chain_type", "char[32]"], ["body_type", "char[32]"],
+  ["license_plate", "char[32]"], ["license_plate_country_id", "char[32]"],
+  ["hook_position", "Vec3"],
+  ["wheel_count", "u32"],
+  ["wheel_position", "Vec3[MAX_WHEELS]"],
+  ["wheel_radius", "f32[MAX_WHEELS]"],
+  ["wheel_steerable", "u8[MAX_WHEELS]"], ["wheel_simulated", "u8[MAX_WHEELS]"],
+  ["wheel_powered", "u8[MAX_WHEELS]"], ["wheel_liftable", "u8[MAX_WHEELS]"],
+]
+
+[[struct]]
+name = "JobConfig"
+fields = [
+  ["seq", "u32"], ["present", "u8"], ["cargo_loaded", "u8"], ["special_job", "u8"], ["_pad", "u8"],
+  ["cargo_id", "char[64]"], ["cargo", "char[64]"],
+  ["cargo_mass", "f32"], ["cargo_unit_mass", "f32"], ["cargo_unit_count", "u32"],
+  ["delivery_time", "u32"],             # absolute in-game minutes
+  ["planned_distance_km", "u32"], ["_pad2", "u32"],
+  ["income", "u64"],                    # EUR
+  ["destination_city_id", "char[64]"], ["destination_city", "char[64]"],
+  ["destination_company_id", "char[64]"], ["destination_company", "char[64]"],
+  ["source_city_id", "char[64]"], ["source_city", "char[64]"],
+  ["source_company_id", "char[64]"], ["source_company", "char[64]"],
+  ["job_market", "char[32]"],
+]
+
+[[struct]]
+name = "ControlsConfig"
+fields = [["seq", "u32"], ["present", "u8"], ["_pad", "u8[3]"], ["shifter_type", "char[16]"]]
+
+[[struct]]
+name = "ConfigBlock"
+fields = [
+  ["config_seq", "u64"],                # seqlock: odd while the DLL is writing
+  ["truck", "TruckConfig"],
+  ["trailers", "TrailerConfig[MAX_TRAILERS]"],
+  ["job", "JobConfig"],
+  ["controls", "ControlsConfig"],
+]
+
+# ---------------------------------------------------------------- gameplay events
+
+[[struct]]
+name = "EventSlot"
+fields = [
+  ["seq", "u64"],                       # event number (1-based); slot = (seq - 1) % EVENT_SLOTS
+  ["game_time", "u32"],
+  ["attr_count", "u32"],
+  ["id", "char[48]"],                   # e.g. "player.fined"
+  ["attrs", "char[456]"],               # "name=value;name=value"
+]
+
+# ---------------------------------------------------------------- headers
+
+[[struct]]
+name = "TelemetryHeader"
+fields = [
+  ["magic", "u32"], ["layout_version", "u32"], ["layout_hash", "u64"],
+  ["header_size", "u32"], ["frame_size", "u32"], ["ring_slots", "u32"], ["frames_offset", "u32"],
+  ["config_offset", "u32"], ["config_size", "u32"], ["events_offset", "u32"], ["event_size", "u32"],
+  ["event_slots", "u32"], ["game_pid", "u32"],
+  ["telemetry_api_version", "u32"], ["telemetry_game_version", "u32"],
+  ["input_api_version", "u32"], ["input_game_version", "u32"],
+  ["input_registered", "u32"], ["input_active", "u32"],
+  ["paused", "u32"], ["bridge_flags", "u32"],          # see BRIDGE_FLAG_* in gen output
+  ["watchdog_ms", "u32"], ["input_count", "u32"],
+  ["frame_counter", "u64"],                            # newest published frame seq (0 = none)
+  ["event_write_index", "u64"],                        # events written so far
+  ["qpc_frequency", "u64"],
+  ["input_frames", "u64"],                             # input frames processed while active
+  ["last_input_qpc", "u64"],
+  ["applied_write_seq", "u64"],                        # newest controls write_seq the game has seen
+  ["watchdog_trips", "u64"],
+  ["kill_count", "u64"],
+  ["game_name", "char[32]"], ["game_id", "char[16]"], ["bridge_version", "char[16]"],
+]
+
+[[struct]]
+name = "ControlsHeader"
+fields = [
+  ["magic", "u32"], ["layout_version", "u32"], ["layout_hash", "u64"],
+  ["client_pid", "u32"],
+  ["enable", "u32"],                    # 1 = AutoHaul wants control; 0 = release everything
+  ["watchdog_ms", "u32"],               # 0 = DLL default (250); clamped to [50, 1000]
+  ["rearm_counter", "u32"],             # change it to clear a latched kill (only while no kill key is held)
+  ["write_seq", "u64"],                 # incremented by every commit
+  ["heartbeat_qpc", "u64"],             # QueryPerformanceCounter at the last commit
+  ["extra_kill_vk", "u8[MAX_EXTRA_KILL_VK]"],
+]
+
+[bridge_flags]
+KILL_LATCHED = 1
+CONTROL_ALIVE = 2       # heartbeat fresh and enable=1
+CONTROL_ACTIVE = 4      # values are being sent to the game
+TELEMETRY_OK = 8
+INPUT_OK = 16
+
+# ---------------------------------------------------------------- telemetry channels
+# sdk: channel name; "{t}" expands to trailer index 0..MAX_TRAILERS-1.
+# type: SDK value type the channel is registered with.
+# field: destination in TelemetryFrame; "[{i}]" expands for indexed channels.
+# indexed: constant giving the number of indices (wheels).
+
+[[channel]]
+sdk = "game.time"
+type = "u32"
+field = "game_time"
+[[channel]]
+sdk = "rest.stop"
+type = "s32"
+field = "next_rest_stop"
+[[channel]]
+sdk = "mandatory.break"
+type = "s32"
+field = "next_mandatory_break"
+[[channel]]
+sdk = "multiplayer.time.offset"
+type = "s32"
+field = "multiplayer_time_offset"
+[[channel]]
+sdk = "local.scale"
+type = "float"
+field = "local_scale"
+[[channel]]
+sdk = "job.cargo.damage"
+type = "float"
+field = "job_cargo_damage"
+
+[[channel]]
+sdk = "truck.world.placement"
+type = "dplacement"
+field = "truck_placement"
+[[channel]]
+sdk = "truck.local.velocity.linear"
+type = "fvector"
+field = "local_linear_velocity"
+[[channel]]
+sdk = "truck.local.velocity.angular"
+type = "fvector"
+field = "local_angular_velocity"
+[[channel]]
+sdk = "truck.local.acceleration.linear"
+type = "fvector"
+field = "local_linear_acceleration"
+[[channel]]
+sdk = "truck.local.acceleration.angular"
+type = "fvector"
+field = "local_angular_acceleration"
+[[channel]]
+sdk = "truck.cabin.offset"
+type = "fplacement"
+field = "cabin_offset"
+[[channel]]
+sdk = "truck.head.offset"
+type = "fplacement"
+field = "head_offset"
+[[channel]]
+sdk = "truck.speed"
+type = "float"
+field = "speed"
+[[channel]]
+sdk = "truck.engine.rpm"
+type = "float"
+field = "engine_rpm"
+[[channel]]
+sdk = "truck.engine.gear"
+type = "s32"
+field = "engine_gear"
+[[channel]]
+sdk = "truck.displayed.gear"
+type = "s32"
+field = "displayed_gear"
+[[channel]]
+sdk = "truck.input.steering"
+type = "float"
+field = "input_steering"
+[[channel]]
+sdk = "truck.input.throttle"
+type = "float"
+field = "input_throttle"
+[[channel]]
+sdk = "truck.input.brake"
+type = "float"
+field = "input_brake"
+[[channel]]
+sdk = "truck.input.clutch"
+type = "float"
+field = "input_clutch"
+[[channel]]
+sdk = "truck.effective.steering"
+type = "float"
+field = "effective_steering"
+[[channel]]
+sdk = "truck.effective.throttle"
+type = "float"
+field = "effective_throttle"
+[[channel]]
+sdk = "truck.effective.brake"
+type = "float"
+field = "effective_brake"
+[[channel]]
+sdk = "truck.effective.clutch"
+type = "float"
+field = "effective_clutch"
+[[channel]]
+sdk = "truck.cruise_control"
+type = "float"
+field = "cruise_control"
+[[channel]]
+sdk = "truck.hshifter.slot"
+type = "u32"
+field = "hshifter_slot"
+[[channel]]
+sdk = "truck.brake.parking"
+type = "bool"
+field = "parking_brake"
+[[channel]]
+sdk = "truck.brake.motor"
+type = "bool"
+field = "motor_brake"
+[[channel]]
+sdk = "truck.brake.retarder"
+type = "u32"
+field = "retarder_level"
+[[channel]]
+sdk = "truck.brake.air.pressure"
+type = "float"
+field = "brake_air_pressure"
+[[channel]]
+sdk = "truck.brake.air.pressure.warning"
+type = "bool"
+field = "air_pressure_warning"
+[[channel]]
+sdk = "truck.brake.air.pressure.emergency"
+type = "bool"
+field = "air_pressure_emergency"
+[[channel]]
+sdk = "truck.brake.temperature"
+type = "float"
+field = "brake_temperature"
+[[channel]]
+sdk = "truck.fuel.amount"
+type = "float"
+field = "fuel"
+[[channel]]
+sdk = "truck.fuel.warning"
+type = "bool"
+field = "fuel_warning"
+[[channel]]
+sdk = "truck.fuel.consumption.average"
+type = "float"
+field = "fuel_average_consumption"
+[[channel]]
+sdk = "truck.fuel.range"
+type = "float"
+field = "fuel_range"
+[[channel]]
+sdk = "truck.adblue"
+type = "float"
+field = "adblue"
+[[channel]]
+sdk = "truck.adblue.warning"
+type = "bool"
+field = "adblue_warning"
+[[channel]]
+sdk = "truck.adblue.consumption.average"
+type = "float"
+field = "adblue_average_consumption"
+[[channel]]
+sdk = "truck.oil.pressure"
+type = "float"
+field = "oil_pressure"
+[[channel]]
+sdk = "truck.oil.pressure.warning"
+type = "bool"
+field = "oil_pressure_warning"
+[[channel]]
+sdk = "truck.oil.temperature"
+type = "float"
+field = "oil_temperature"
+[[channel]]
+sdk = "truck.water.temperature"
+type = "float"
+field = "water_temperature"
+[[channel]]
+sdk = "truck.water.temperature.warning"
+type = "bool"
+field = "water_temperature_warning"
+[[channel]]
+sdk = "truck.battery.voltage"
+type = "float"
+field = "battery_voltage"
+[[channel]]
+sdk = "truck.battery.voltage.warning"
+type = "bool"
+field = "battery_voltage_warning"
+[[channel]]
+sdk = "truck.electric.enabled"
+type = "bool"
+field = "electric_enabled"
+[[channel]]
+sdk = "truck.engine.enabled"
+type = "bool"
+field = "engine_enabled"
+[[channel]]
+sdk = "truck.lblinker"
+type = "bool"
+field = "lblinker"
+[[channel]]
+sdk = "truck.rblinker"
+type = "bool"
+field = "rblinker"
+[[channel]]
+sdk = "truck.hazard.warning"
+type = "bool"
+field = "hazard_warning"
+[[channel]]
+sdk = "truck.light.lblinker"
+type = "bool"
+field = "light_lblinker"
+[[channel]]
+sdk = "truck.light.rblinker"
+type = "bool"
+field = "light_rblinker"
+[[channel]]
+sdk = "truck.light.parking"
+type = "bool"
+field = "light_parking"
+[[channel]]
+sdk = "truck.light.beam.low"
+type = "bool"
+field = "light_low_beam"
+[[channel]]
+sdk = "truck.light.beam.high"
+type = "bool"
+field = "light_high_beam"
+[[channel]]
+sdk = "truck.light.aux.front"
+type = "u32"
+field = "light_aux_front"
+[[channel]]
+sdk = "truck.light.aux.roof"
+type = "u32"
+field = "light_aux_roof"
+[[channel]]
+sdk = "truck.light.beacon"
+type = "bool"
+field = "light_beacon"
+[[channel]]
+sdk = "truck.light.brake"
+type = "bool"
+field = "light_brake"
+[[channel]]
+sdk = "truck.light.reverse"
+type = "bool"
+field = "light_reverse"
+[[channel]]
+sdk = "truck.wipers"
+type = "bool"
+field = "wipers"
+[[channel]]
+sdk = "truck.dashboard.backlight"
+type = "float"
+field = "dashboard_backlight"
+[[channel]]
+sdk = "truck.differential_lock"
+type = "bool"
+field = "differential_lock"
+[[channel]]
+sdk = "truck.lift_axle"
+type = "bool"
+field = "lift_axle"
+[[channel]]
+sdk = "truck.lift_axle.indicator"
+type = "bool"
+field = "lift_axle_indicator"
+[[channel]]
+sdk = "truck.trailer.lift_axle"
+type = "bool"
+field = "trailer_lift_axle"
+[[channel]]
+sdk = "truck.trailer.lift_axle.indicator"
+type = "bool"
+field = "trailer_lift_axle_indicator"
+[[channel]]
+sdk = "truck.wear.engine"
+type = "float"
+field = "wear_engine"
+[[channel]]
+sdk = "truck.wear.transmission"
+type = "float"
+field = "wear_transmission"
+[[channel]]
+sdk = "truck.wear.cabin"
+type = "float"
+field = "wear_cabin"
+[[channel]]
+sdk = "truck.wear.chassis"
+type = "float"
+field = "wear_chassis"
+[[channel]]
+sdk = "truck.wear.wheels"
+type = "float"
+field = "wear_wheels"
+[[channel]]
+sdk = "truck.odometer"
+type = "float"
+field = "odometer"
+[[channel]]
+sdk = "truck.navigation.distance"
+type = "float"
+field = "navigation_distance"
+[[channel]]
+sdk = "truck.navigation.time"
+type = "float"
+field = "navigation_time"
+[[channel]]
+sdk = "truck.navigation.speed.limit"
+type = "float"
+field = "navigation_speed_limit"
+[[channel]]
+sdk = "truck.wheel.steering"
+type = "float"
+field = "wheel_steering[{i}]"
+indexed = "MAX_WHEELS"
+[[channel]]
+sdk = "truck.wheel.angular_velocity"
+type = "float"
+field = "wheel_velocity[{i}]"
+indexed = "MAX_WHEELS"
+[[channel]]
+sdk = "truck.wheel.suspension.deflection"
+type = "float"
+field = "wheel_susp_deflection[{i}]"
+indexed = "MAX_WHEELS"
+[[channel]]
+sdk = "truck.wheel.on_ground"
+type = "bool"
+field = "wheel_on_ground[{i}]"
+indexed = "MAX_WHEELS"
+
+[[channel]]
+sdk = "trailer.{t}.connected"
+type = "bool"
+field = "trailers[{t}].connected"
+[[channel]]
+sdk = "trailer.{t}.cargo.damage"
+type = "float"
+field = "trailers[{t}].cargo_damage"
+[[channel]]
+sdk = "trailer.{t}.world.placement"
+type = "dplacement"
+field = "trailers[{t}].placement"
+[[channel]]
+sdk = "trailer.{t}.velocity.linear"
+type = "fvector"
+field = "trailers[{t}].local_linear_velocity"
+[[channel]]
+sdk = "trailer.{t}.velocity.angular"
+type = "fvector"
+field = "trailers[{t}].local_angular_velocity"
+[[channel]]
+sdk = "trailer.{t}.acceleration.linear"
+type = "fvector"
+field = "trailers[{t}].local_linear_acceleration"
+[[channel]]
+sdk = "trailer.{t}.acceleration.angular"
+type = "fvector"
+field = "trailers[{t}].local_angular_acceleration"
+[[channel]]
+sdk = "trailer.{t}.wear.body"
+type = "float"
+field = "trailers[{t}].wear_body"
+[[channel]]
+sdk = "trailer.{t}.wear.chassis"
+type = "float"
+field = "trailers[{t}].wear_chassis"
+[[channel]]
+sdk = "trailer.{t}.wear.wheels"
+type = "float"
+field = "trailers[{t}].wear_wheels"
+
+# ---------------------------------------------------------------- configuration attributes
+# section: config id; "{t}" expands per trailer. "trailer" (no index) is also mapped to trailer 0.
+# Each section's struct is zeroed and refilled on every configuration event for that id.
+
+[[config_section]]
+id = "truck"
+field = "truck"
+[[config_section]]
+id = "trailer.{t}"
+field = "trailers[{t}]"
+[[config_section]]
+id = "job"
+field = "job"
+[[config_section]]
+id = "controls"
+field = "controls"
+
+[[config]]
+section = "truck"
+attrs = [
+  ["brand_id", "string", "brand_id"], ["brand", "string", "brand"], ["id", "string", "id"], ["name", "string", "name"],
+  ["license.plate", "string", "license_plate"], ["license.plate.country.id", "string", "license_plate_country_id"],
+  ["fuel.capacity", "float", "fuel_capacity"], ["fuel.warning.factor", "float", "fuel_warning_factor"],
+  ["adblue.capacity", "float", "adblue_capacity"], ["adblue.warning.factor", "float", "adblue_warning_factor"],
+  ["brake.air.pressure.warning", "float", "air_pressure_warning"],
+  ["brake.air.pressure.emergency", "float", "air_pressure_emergency"],
+  ["oil.pressure.warning", "float", "oil_pressure_warning"],
+  ["water.temperature.warning", "float", "water_temperature_warning"],
+  ["battery.voltage.warning", "float", "battery_voltage_warning"],
+  ["rpm.limit", "float", "rpm_limit"],
+  ["gears.forward", "u32", "forward_gear_count"], ["gears.reverse", "u32", "reverse_gear_count"],
+  ["retarder.steps", "u32", "retarder_step_count"],
+  ["differential.ratio", "float", "differential_ratio"],
+  ["forward.ratio", "float", "forward_ratio[{i}]", "MAX_FORWARD_GEARS"],
+  ["reverse.ratio", "float", "reverse_ratio[{i}]", "MAX_REVERSE_GEARS"],
+  ["cabin.position", "fvector", "cabin_position"], ["head.position", "fvector", "head_position"],
+  ["hook.position", "fvector", "hook_position"],
+  ["wheels.count", "u32", "wheel_count"],
+  ["wheel.position", "fvector", "wheel_position[{i}]", "MAX_WHEELS"],
+  ["wheel.radius", "float", "wheel_radius[{i}]", "MAX_WHEELS"],
+  ["wheel.steerable", "bool", "wheel_steerable[{i}]", "MAX_WHEELS"],
+  ["wheel.simulated", "bool", "wheel_simulated[{i}]", "MAX_WHEELS"],
+  ["wheel.powered", "bool", "wheel_powered[{i}]", "MAX_WHEELS"],
+  ["wheel.liftable", "bool", "wheel_liftable[{i}]", "MAX_WHEELS"],
+]
+
+[[config]]
+section = "trailer.{t}"
+attrs = [
+  ["id", "string", "id"], ["cargo.accessory.id", "string", "cargo_accessory_id"],
+  ["brand_id", "string", "brand_id"], ["brand", "string", "brand"], ["name", "string", "name"],
+  ["chain.type", "string", "chain_type"], ["body.type", "string", "body_type"],
+  ["license.plate", "string", "license_plate"], ["license.plate.country.id", "string", "license_plate_country_id"],
+  ["hook.position", "fvector", "hook_position"],
+  ["wheels.count", "u32", "wheel_count"],
+  ["wheel.position", "fvector", "wheel_position[{i}]", "MAX_WHEELS"],
+  ["wheel.radius", "float", "wheel_radius[{i}]", "MAX_WHEELS"],
+  ["wheel.steerable", "bool", "wheel_steerable[{i}]", "MAX_WHEELS"],
+  ["wheel.simulated", "bool", "wheel_simulated[{i}]", "MAX_WHEELS"],
+  ["wheel.powered", "bool", "wheel_powered[{i}]", "MAX_WHEELS"],
+  ["wheel.liftable", "bool", "wheel_liftable[{i}]", "MAX_WHEELS"],
+]
+
+[[config]]
+section = "job"
+attrs = [
+  ["cargo.id", "string", "cargo_id"], ["cargo", "string", "cargo"],
+  ["cargo.mass", "float", "cargo_mass"], ["cargo.unit.mass", "float", "cargo_unit_mass"],
+  ["cargo.unit.count", "u32", "cargo_unit_count"],
+  ["destination.city.id", "string", "destination_city_id"], ["destination.city", "string", "destination_city"],
+  ["destination.company.id", "string", "destination_company_id"], ["destination.company", "string", "destination_company"],
+  ["source.city.id", "string", "source_city_id"], ["source.city", "string", "source_city"],
+  ["source.company.id", "string", "source_company_id"], ["source.company", "string", "source_company"],
+  ["income", "u64", "income"], ["delivery.time", "u32", "delivery_time"],
+  ["planned_distance.km", "u32", "planned_distance_km"],
+  ["cargo.loaded", "bool", "cargo_loaded"], ["job.market", "string", "job_market"],
+  ["is.special.job", "bool", "special_job"],
+]
+
+[[config]]
+section = "controls"
+attrs = [["shifter.type", "string", "shifter_type"]]

@@ -1,0 +1,25 @@
+# Pinned third-party dependencies for game 1.53.2.1 (see ARCHITECTURE.md §1.2).
+# Fetched by `python tools/fetch_deps.py` into <cache_dir>/third_party/<name>.
+# Patches are applied in order with `git apply` after checkout.
+
+[ets2la_plugin]
+repo = "https://github.com/ETS2LA/plugin.git"
+commit = "c328dc3807cf8e37d0f109a04f3827b7508a0d08"   # 2025-03-12, last before "update data structures for 1.54"
+submodules = true
+license = "MIT"
+patches = ["patches/ets2la_plugin/0001-disable-steering-hook.patch"]
+
+[trucksim_maps]
+repo = "https://github.com/truckermudgeon/maps.git"
+commit = "eca70d70e8a5168f6e2b7a21c507ac7c401934d6"   # 2025-02-17, includes "support 1.53 release" (79f43437)
+submodules = true    # NVIDIA libdeflate (GDeflate decompression for HashFS v2)
+license = "GPL-3.0"
+patches = []   # Phase 2 adds nav-curve flags, semaphore IDs and fuel prices
+
+[trucklib]
+repo = "https://github.com/sk-zk/TruckLib.git"
+commit = "b658cdceae5cf2d855123457728709e3d893d791"   # tag v0.1.7, map format 901 (game 1.51-1.54)
+submodules = false
+license = "GPL-2.0"
+optional = true
+patches = []

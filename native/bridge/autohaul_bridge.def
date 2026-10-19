@@ -1,0 +1,7 @@
+LIBRARY autohaul_bridge
+EXPORTS
+    scs_telemetry_init
+    scs_telemetry_shutdown
+    scs_input_init
+    scs_input_shutdown
+    autohaul_test_force_kill_key

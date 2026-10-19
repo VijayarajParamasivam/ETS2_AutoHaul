@@ -1,0 +1,42 @@
+# Shared-memory blocks written by ETS2LA/plugin @ c328dc38 (the 1.53 pin, read-only build).
+# Derived from src/core.cpp at that commit (write_*_mem and create_*_memory), NOT from its README:
+# the README there still shows the older 50-byte vehicle record without the persistent id.
+#
+# struct formats use Python `struct` syntax, little-endian, packed ("<").
+# World X/Z = local + 512 * sector (cx, cz) where a block reports sector coordinates separately.
+
+[camera]
+mapping = 'Local\ETS2LACameraProps'
+record = "<ffffhhffff"        # fov, x, y, z, cx, cz, qw, qx, qy, qz
+count = 1
+fields = ["fov", "x", "y", "z", "cx", "cz", "qw", "qx", "qy", "qz"]
+world_from_sector = true
+
+[traffic]
+mapping = 'Local\ETS2LATraffic'
+# vehicle: x y z (world), qw qx qy qz, width height length, speed, acceleration, trailer_count, id
+# then 2 trailers: x y z (world), qw qx qy qz, width height length
+record = "<ffffffffffffhh" # 52 bytes
+trailer = "<ffffffffff"     # 40 bytes
+trailers_per_vehicle = 2
+count = 20
+fields = ["x", "y", "z", "qw", "qx", "qy", "qz", "width", "height", "length", "speed", "acceleration", "trailer_count", "id"]
+trailer_fields = ["x", "y", "z", "qw", "qx", "qy", "qz", "width", "height", "length"]
+world_from_sector = false
+
+[semaphore]
+mapping = 'Local\ETS2LASemaphore'
+record = "<fffffffffifii"     # x y z (sector-local), cx cz (sector), qw qx qy qz, type, time_remaining, state, id
+count = 20
+fields = ["x", "y", "z", "cx", "cz", "qw", "qx", "qy", "qz", "type", "time_remaining", "state", "id"]
+world_from_sector = true
+# type: 1 = traffic light, 2 = gate
+# traffic light state: 0 off, 1 orange->red, 2 red, 4 orange->green, 8 green, 32 sleep
+# gate state: 0 closing, 1 closed, 2 opening, 3 open
+
+[route]
+mapping = 'Local\ETS2LARoute'
+record = "<qff"               # node_uid, distance_to_end (m), time_to_end (s)
+count = 5000
+fields = ["node_uid", "distance_to_end", "time_to_end"]
+world_from_sector = false

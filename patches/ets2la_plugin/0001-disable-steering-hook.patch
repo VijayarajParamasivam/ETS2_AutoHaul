@@ -1,0 +1,20 @@
+diff --git a/src/core.cpp b/src/core.cpp
+index 2061708..67ee453 100644
+--- a/src/core.cpp
++++ b/src/core.cpp
+@@ -922,11 +922,10 @@ namespace ets2_la_plugin
+             return false;
+         }
+ 
+-        if (!this->init_truck_steering_manipulation())
+-        {
+-            this->error("Could not initialize truck steering data");
+-            return false;
+-        }
++        // AutoHaul: steering manipulation (MinHook on physics_vehicle_u::steering_advance) is
++        // disabled so this plugin only reads game memory. All control goes through the SDK
++        // input device in autohaul_bridge.dll.
++        this->info("AutoHaul read-only build: steering hook disabled");
+ 
+         return true;
+     }

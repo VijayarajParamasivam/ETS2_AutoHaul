@@ -1,0 +1,111 @@
+# Inputs of the AutoHaul semantical SDK device. Each `mix` must appear as `semantical.<mix>?0`
+# in the game's controls.sii (checked on 1.53.2.1, profile 56696A6179, 2026-10-19).
+#
+# kind: axis  -> float value (steering -1..1, pedals 0..1, UI stick deflection 0..1)
+#       hold  -> bool held while the client says so (horn, trailer brake, ...)
+#       pulse -> bool, one press per client pulse (the DLL emits True for one input frame, then False)
+# The DLL supports hold and pulse for every button; `kind` only picks the default Python API.
+#
+# Axes are listed first; their order defines the axis indices.
+
+axes = [
+  # mix,        display name,       description
+  ["steering",  "Steering",         "+1 = full right, -1 = full left (the game subtracts this from its CCW steering mix)"],
+  ["aforward",  "Throttle",         "0..1"],
+  ["abackward", "Brake",            "0..1"],
+  ["clutch",    "Clutch",           "0..1"],
+  ["j_left",    "UI Left",          "menu stick, 0..1"],
+  ["j_right",   "UI Right",         "menu stick, 0..1"],
+  ["j_up",      "UI Up",            "menu stick, 0..1"],
+  ["j_down",    "UI Down",          "menu stick, 0..1"],
+]
+
+buttons = [
+  # mix,           kind,    group,       description
+  # --- transmission
+  ["gearup",       "pulse", "gear",      "shift up"],
+  ["geardown",     "pulse", "gear",      "shift down"],
+  ["gear0",        "pulse", "gear",      "neutral"],
+  ["geardrive",    "pulse", "gear",      "automatic: drive"],
+  ["gearreverse",  "pulse", "gear",      "automatic: reverse"],
+  # --- brakes
+  ["parkingbrake", "pulse", "brake",     "toggle parking brake"],
+  ["trailerbrake", "hold",  "brake",     "trailer brake"],
+  ["motorbrake",   "hold",  "brake",     "engine brake"],
+  ["engbraketog",  "pulse", "brake",     "engine brake toggle"],
+  ["engbrakeup",   "pulse", "brake",     "engine brake level up"],
+  ["engbrakedwn",  "pulse", "brake",     "engine brake level down"],
+  ["engbrakeauto", "pulse", "brake",     "engine brake automatic mode"],
+  ["retarderup",   "pulse", "brake",     "retarder level up"],
+  ["retarderdown", "pulse", "brake",     "retarder level down"],
+  ["retarder0",    "pulse", "brake",     "retarder off"],
+  ["retarder1",    "pulse", "brake",     "retarder level 1"],
+  ["retarder2",    "pulse", "brake",     "retarder level 2"],
+  ["retarder3",    "pulse", "brake",     "retarder level 3"],
+  ["retarder4",    "pulse", "brake",     "retarder level 4"],
+  ["retarder5",    "pulse", "brake",     "retarder level 5"],
+  ["retarderauto", "pulse", "brake",     "retarder automatic mode"],
+  ["embrake",      "hold",  "brake",     "emergency brake"],
+  # --- cruise control (kept off while AutoHaul drives; listed for completeness)
+  ["cruiectrl",    "pulse", "cruise",    "cruise control on/off"],
+  ["cruiectrlinc", "pulse", "cruise",    "cruise speed +"],
+  ["cruiectrldec", "pulse", "cruise",    "cruise speed -"],
+  ["cruiectrlres", "pulse", "cruise",    "cruise resume"],
+  # --- engine
+  ["engine",       "pulse", "engine",    "engine start/stop"],
+  ["engineelect",  "pulse", "engine",    "electricity on/off"],
+  ["ignitionon",   "pulse", "engine",    "ignition on"],
+  ["ignitionoff",  "pulse", "engine",    "ignition off"],
+  ["ignitionstrt", "hold",  "engine",    "starter"],
+  # --- drivetrain
+  ["diflock",      "pulse", "drivetrain", "differential lock"],
+  ["liftaxle",     "pulse", "drivetrain", "truck lift axle"],
+  ["liftaxlet",    "pulse", "drivetrain", "trailer lift axle"],
+  # --- signals and lights
+  ["lblinker",     "pulse", "signal",    "left indicator toggle"],
+  ["rblinker",     "pulse", "signal",    "right indicator toggle"],
+  ["lblinkerh",    "hold",  "signal",    "left indicator (hold)"],
+  ["rblinkerh",    "hold",  "signal",    "right indicator (hold)"],
+  ["flasher4way",  "pulse", "signal",    "hazard lights toggle"],
+  ["light",        "pulse", "light",     "cycle lights"],
+  ["lighton",      "pulse", "light",     "lights on"],
+  ["lightoff",     "pulse", "light",     "lights off"],
+  ["lightpark",    "pulse", "light",     "parking lights"],
+  ["hblight",      "pulse", "light",     "high beam toggle"],
+  ["lighthorn",    "hold",  "light",     "headlight flash"],
+  ["beacon",       "pulse", "light",     "beacon"],
+  ["horn",         "hold",  "signal",    "horn"],
+  ["airhorn",      "hold",  "signal",    "air horn"],
+  ["wipers",       "pulse", "wipers",    "cycle wipers"],
+  ["wipers0",      "pulse", "wipers",    "wipers off"],
+  ["wipers1",      "pulse", "wipers",    "wipers level 1"],
+  ["wipers2",      "pulse", "wipers",    "wipers level 2"],
+  ["wipers3",      "pulse", "wipers",    "wipers level 3"],
+  ["wipers4",      "pulse", "wipers",    "wipers level 4"],
+  ["wipersback",   "pulse", "wipers",    "wipers previous level"],
+  # --- interaction
+  ["activate",     "pulse", "interact",  "interact / confirm (Enter)"],
+  ["attach",       "pulse", "interact",  "attach / detach trailer"],
+  ["quickpark",    "pulse", "interact",  "quick park"],
+  ["navmap",       "pulse", "interact",  "navigation map"],
+  ["quicksave",    "pulse", "interact",  "quick save"],
+  ["screenshot",   "pulse", "interact",  "screenshot"],
+  ["showhud",      "pulse", "interact",  "toggle HUD"],
+  # --- UI
+  ["menu",         "pulse", "ui",        "pause menu / close window"],
+  ["pause",        "pulse", "ui",        "pause game"],
+  ["selectfcs",    "pulse", "ui",        "confirm focused entry"],
+  ["back",         "pulse", "ui",        "back"],
+  ["skip",         "pulse", "ui",        "skip screen"],
+  # --- cameras
+  ["cam1",         "pulse", "camera",    "camera 1 (interior)"],
+  ["cam2",         "pulse", "camera",    "camera 2"],
+  ["cam3",         "pulse", "camera",    "camera 3"],
+  ["cam4",         "pulse", "camera",    "camera 4"],
+  ["cam5",         "pulse", "camera",    "camera 5"],
+  ["cam6",         "pulse", "camera",    "camera 6"],
+  ["cam7",         "pulse", "camera",    "camera 7"],
+  ["cam8",         "pulse", "camera",    "camera 8"],
+  ["lookleft",     "hold",  "camera",    "look left"],
+  ["lookright",    "hold",  "camera",    "look right"],
+]

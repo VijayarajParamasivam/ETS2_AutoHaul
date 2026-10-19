@@ -1,0 +1,4 @@
+# Normalize text files in the repo; the working tree follows the local platform.
+* text=auto
+# Patches are applied with `git apply` by tools/fetch_deps.py and must stay byte-exact.
+*.patch -text

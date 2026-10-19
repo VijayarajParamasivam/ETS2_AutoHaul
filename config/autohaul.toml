@@ -1,0 +1,57 @@
+# AutoHaul configuration. Every tunable lives here; units are part of the key name.
+# Put machine-specific overrides in config/local.toml (git-ignored); it is merged on top of this file.
+
+[game]
+install_dir = 'C:\Games\Euro Truck Simulator 2'
+home_dir = '%USERPROFILE%\OneDrive\Documents\Euro Truck Simulator 2'
+expected_version = "1.53.2.1"
+
+[paths]
+# Large generated data (third-party checkouts, node_modules, native builds, map data, recordings, logs)
+# lives outside OneDrive so it is not synced. Not under AppData: packaged apps (e.g. the Claude
+# desktop app) get AppData writes redirected into private storage that other programs can't see.
+cache_dir = '%USERPROFILE%\AutoHaul'
+
+[bridge]
+# Must match the values compiled into autohaul_bridge.dll (native/spec/layout.toml).
+telemetry_mapping = 'Local\AutoHaul_Telemetry'
+controls_mapping = 'Local\AutoHaul_Controls'
+frame_event = 'Local\AutoHaul_Frame'
+frame_wait_timeout_ms = 100
+
+[safety]
+# Kill switch. Keys are Windows virtual-key names (see autohaul/safety/keys.py).
+# BACKSLASH is unbound in your controls.sii; PAUSE also pauses the game.
+kill_keys = ["BACKSLASH", "PAUSE"]
+# Xbox controller chord that also triggers the kill switch.
+kill_xinput_chord = ["BACK", "START"]
+# Manual override: any of these hands control back immediately.
+override_stick_deadzone = 0.25          # left stick deflection, 0..1
+override_trigger_threshold = 0.15       # triggers, 0..1
+override_keys = ["W", "A", "S", "D", "UP", "DOWN", "LEFT", "RIGHT", "SPACE"]
+# Telemetry cross-check: |truck.input.* - commanded| above these means someone else is steering/driving.
+override_steering_tolerance = 0.12
+override_pedal_tolerance = 0.15
+override_crosscheck_frames = 3          # consecutive frames over tolerance before it counts
+# truck.input.steering = gain * our steering command. The game subtracts the semantical steering
+# axis from its counterclockwise-positive mix, so -1.0 is expected; `phase1_check.py calibrate` measures it.
+steering_input_gain = -1.0
+# Telemetry is considered stale after this long without a new frame ...
+telemetry_stale_ms = 50
+# ... and a test / drive is aborted if it stays stale this long (autosaves briefly freeze the game).
+telemetry_stale_abort_ms = 1000
+# Refuse to engage when any multiplayer indicator is present.
+mp_guard_modules = ["core_ets2mp.dll"]
+
+[recorder]
+enabled = true
+flush_every_frames = 120
+
+[tools.wiggle]
+steering_amplitude = 0.5
+steering_period_s = 4.0
+duration_s = 12.0
+
+[tools.calibrate_steering]   # phase1_check.py calibrate
+levels = [-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0]
+settle_s = 1.5

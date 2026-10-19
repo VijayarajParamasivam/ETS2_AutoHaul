@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autohaul"
+version = "0.1.0"
+description = "Autonomous single-player job runner for Euro Truck Simulator 2 (game 1.53.2.1)"
+requires-python = ">=3.12"
+# Phase 1 runtime is stdlib + ctypes only. Heavier deps (numpy, vision) arrive with the phases that need them.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "cmake>=3.28",
+    "ninja>=1.11",
+]
+
+[tool.setuptools.packages.find]
+include = ["autohaul*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
