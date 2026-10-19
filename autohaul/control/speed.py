@@ -34,6 +34,7 @@ class SpeedParams:
     lat_acc_max: float = 1.4            # m/s^2 in curves (cargo + rollover margin)
     steer_rate_margin: float = 0.6      # plan curves with this fraction of the wheel's top turn rate
     min_curve_kmh: float = 8.0          # the steering-rate limit never plans slower than this
+    steer_reach_deadband: float = 0.06  # rad (3.4 deg) of wheel-angle difference ignored by the reach check
     plan_decel: float = 0.8             # m/s^2 planned braking toward curves / lower limits
     reaction_s: float = 1.0             # s of travel before planned braking starts
     accel_max: float = 0.7              # m/s^2
@@ -97,7 +98,11 @@ class SpeedPlanner:
             r = steer_rate * p.steer_rate_margin
             delta = np.arctan(k * wheelbase)
             v_rate = r / np.maximum(np.abs(np.gradient(delta, s)), 1e-6)
-            reach = np.maximum(s - s0, 1.0) * r / np.maximum(np.abs(delta - steer_now), 1e-6)
+            # differences of a few degrees are ordinary corrections, not a wheel that must swing; and
+            # a point is never closer than half a second of travel
+            swing = np.abs(delta - steer_now) - p.steer_reach_deadband
+            room = np.maximum(s - s0, 0.0) + 0.5 * max(speed, 2.0)
+            reach = np.where(swing > 0, room * r / np.maximum(swing, 1e-6), np.inf)
             v_c = np.maximum(np.minimum(v_c, np.minimum(v_rate, reach)), p.min_curve_kmh / 3.6)
         kinds = ["curve"] * len(s)
         if stop_at is not None:

@@ -86,8 +86,9 @@ struct Bridge {
     scs_input_event_t queue[NUM_INPUTS] = {};
     uint32_t queue_len = 0;
     uint32_t queue_pos = 0;
-    InputState sent;                 // last values handed to the game
-    bool sent_valid = false;
+    InputState sent;                 // last values the game actually fetched
+    bool force[NUM_INPUTS] = {};     // re-send even if unchanged (after (re)activation)
+    uint32_t rr_start = 0;           // queue starts just after the last delivered input (fairness)
     bool client_known = false;
     uint32_t client_pid = 0;
     uint32_t seen_pulses[NUM_BUTTONS] = {};
@@ -465,7 +466,12 @@ void queue_button(uint32_t j, bool v) {
     e.value_bool.value = v ? 1 : 0;
 }
 
+void mark_delivered(const scs_input_event_t& e);
+
 void prepare_input_frame(bool resend_all) {
+    if (g.queue_pos < g.queue_len) {
+        g.hdr->input_events_requeued += g.queue_len - g.queue_pos;   // offered last frame, never fetched
+    }
     g.queue_len = 0;
     g.queue_pos = 0;
     const uint64_t now = qpc_now();
@@ -547,9 +553,15 @@ void prepare_input_frame(bool resend_all) {
             g.pending_pulses[j] = 0;
             g.pulse_phase[j] = 0;
         }
+        // A pulse is one pressed frame then one released frame. Each step advances only once the game
+        // has fetched it, so pulses survive a game that takes fewer events per frame than we offer.
         bool pulse_out = false;
-        if (g.pulse_phase[j] == 1) {
-            g.pulse_phase[j] = 2;  // release frame after a press
+        if (g.pulse_phase[j] == 1 && !g.sent.buttons[j]) {
+            pulse_out = true;                // press not delivered yet: keep offering it
+        } else if (g.pulse_phase[j] == 1) {
+            g.pulse_phase[j] = 2;            // release after a delivered press
+        } else if (g.pulse_phase[j] == 2 && g.sent.buttons[j] && !(active && snap.holds[j] != 0)) {
+            // release not delivered yet: stay in phase 2 (target false)
         } else if (g.pending_pulses[j] > 0) {
             g.pending_pulses[j] -= 1;
             g.pulse_phase[j] = 1;
@@ -560,19 +572,41 @@ void prepare_input_frame(bool resend_all) {
         target.buttons[j] = (active && snap.holds[j] != 0) || pulse_out;
     }
 
-    const bool all = resend_all || !g.sent_valid;
-    for (uint32_t i = 0; i < NUM_AXES; ++i) {
-        if (all || std::fabs(target.axes[i] - g.sent.axes[i]) > 1e-6f) {
-            queue_axis(i, target.axes[i]);
+    // Offer every input whose value differs from what the game last *fetched*. The 1.53 game was seen to
+    // take fewer events per frame than offered; events it doesn't fetch stay dirty and are offered again
+    // next frame, starting after the last delivered input so steering, throttle and brake take turns.
+    if (resend_all) {
+        for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
+            g.force[k] = true;
         }
     }
-    for (uint32_t j = 0; j < NUM_BUTTONS; ++j) {
-        if (all || target.buttons[j] != g.sent.buttons[j]) {
-            queue_button(j, target.buttons[j]);
+    for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
+        const uint32_t i = (g.rr_start + k) % NUM_INPUTS;
+        if (i < NUM_AXES) {
+            if (g.force[i] || std::fabs(target.axes[i] - g.sent.axes[i]) > 1e-6f) {
+                queue_axis(i, target.axes[i]);
+            }
+        } else {
+            const uint32_t j = i - NUM_AXES;
+            if (g.force[i] || target.buttons[j] != g.sent.buttons[j]) {
+                queue_button(j, target.buttons[j]);
+            }
         }
     }
-    g.sent = target;
-    g.sent_valid = true;
+}
+
+void mark_delivered(const scs_input_event_t& e) {
+    const uint32_t i = e.input_index;
+    if (i < NUM_AXES) {
+        g.sent.axes[i] = e.value_float.value;
+    } else if (i < NUM_INPUTS) {
+        g.sent.buttons[i - NUM_AXES] = e.value_bool.value != 0;
+    }
+    if (i < NUM_INPUTS) {
+        g.force[i] = false;
+        g.rr_start = (i + 1) % NUM_INPUTS;
+    }
+    g.hdr->input_events_delivered += 1;
 }
 
 SCSAPI_RESULT on_input_event(scs_input_event_t* const event_info, const scs_u32_t flags, const scs_context_t) {
@@ -582,8 +616,10 @@ SCSAPI_RESULT on_input_event(scs_input_event_t* const event_info, const scs_u32_
     if (flags & SCS_INPUT_EVENT_CALLBACK_FLAG_first_in_frame) {
         prepare_input_frame((flags & SCS_INPUT_EVENT_CALLBACK_FLAG_first_after_activation) != 0);
     }
+    g.hdr->input_calls += 1;
     if (g.queue_pos < g.queue_len) {
         *event_info = g.queue[g.queue_pos++];
+        mark_delivered(*event_info);
         return SCS_RESULT_ok;
     }
     return SCS_RESULT_not_found;
@@ -594,7 +630,9 @@ SCSAPI_VOID on_input_active(const scs_u8_t active, const scs_context_t) {
         g.hdr->input_active = active ? 1 : 0;
     }
     if (!active) {
-        g.sent_valid = false;  // resend everything on reactivation
+        for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
+            g.force[k] = true;  // resend everything on reactivation
+        }
     }
 }
 
@@ -704,7 +742,10 @@ SCSAPI_RESULT scs_input_init(const scs_u32_t version, const scs_input_init_param
         logf(SCS_LOG_TYPE_error, "cannot register semantical input device");
         return SCS_RESULT_generic_error;
     }
-    g.sent_valid = false;
+    for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
+        g.force[k] = true;
+    }
+    g.sent = InputState{};
     g.client_known = false;
     g.was_alive = false;
     g.hdr->input_api_version = version;

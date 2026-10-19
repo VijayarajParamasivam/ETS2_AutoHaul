@@ -119,11 +119,14 @@ def test_build_from_parser_json(tmp_path):
     files = {
         "nodes": nodes,
         "roadLooks": [{"token": "look", "offset": 2.0, "lanesRight": ["l", "l"], "lanesLeft": ["l"]}],
-        "roads": [{"uid": "1f", "startNodeUid": "a", "endNodeUid": "b", "roadLookToken": "look", "length": 100.0}],
+        "roads": [{"uid": "1f", "startNodeUid": "a", "endNodeUid": "b", "roadLookToken": "look", "length": 100.0},
+                  {"uid": "3a", "startNodeUid": "a", "endNodeUid": "c", "roadLookToken": "look", "length": 500.0,
+                   "hidden": True}],                                            # closed in the game: left out
         "prefabDescriptions": [{"token": "pf", "nodes": [{"x": 0.0, "y": 0.0, "rotation": 0.0}],
                                 "navCurves": [{"start": {"x": 0.0, "y": 0.0, "rotation": 0.0, "z": 1.0},
                                                "end": {"x": 20.0, "y": 0.0, "rotation": 0.0, "z": 1.0}}]}],
-        "prefabs": [{"uid": "2e", "token": "pf", "nodeUids": ["c"], "originNodeIndex": 0}],
+        "prefabs": [{"uid": "2e", "token": "pf", "nodeUids": ["c"], "originNodeIndex": 0},
+                    {"uid": "4b", "token": "pf", "nodeUids": ["a"], "originNodeIndex": 0, "hidden": True}],
     }
     for name, data in files.items():
         (tmp_path / f"europe-{name}.json").write_text(json.dumps(data))

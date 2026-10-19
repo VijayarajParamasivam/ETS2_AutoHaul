@@ -47,7 +47,7 @@ def main() -> int:
                                          d.get("front_overhang_m", 1.45))
         consts = controls_constants(active_controls_file(cfg))
         ap = Autopilot(lm, geom, steering_mode(cfg), speed_params=speed_params(cfg),
-                       relative_gain=consts.get("c_rsteersens", 0.42))
+                       relative_gain=consts.get("c_rsteersens", 0.42), check_pedals=False)   # sends nothing
         gd = GameDataReader()
         rows, faults, ms = [], {}, []
         engaged = False

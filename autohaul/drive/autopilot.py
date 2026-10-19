@@ -17,7 +17,7 @@ import numpy as np
 
 from autohaul.control.path import PathRef
 from autohaul.control.speed import KMH, Lead, PedalController, SpeedParams, SpeedPlanner, acc_accel, find_lead
-from autohaul.control.steering import AbsoluteServo, LateralController, LateralParams, RelativeServo
+from autohaul.control.steering import AbsoluteServo, LateralController, LateralParams, PulseModulator, RelativeServo
 from autohaul.control.vehicle import TruckGeometry, measured_steer_left, pose_from_frame
 from autohaul.safety.supervisor import Command
 from autohaul.world.lanemap import LaneMap
@@ -39,6 +39,10 @@ class AutopilotParams:
     min_turn_radius_m: float = 40.0       # Phase 2 steers through nothing sharper (junctions are Phase 3)
     sharp_turn_lookahead_s: float = 6.0
     sharp_turn_lookahead_m: float = 60.0
+    pedal_miss_s: float = 0.5             # fault when the game ignores AutoHaul's pedals this long
+    hazard_radius_m: float = 60.0         # toll plaza icons sit within ~50 m of the booths
+    hazard_lookahead_s: float = 8.0
+    hazard_lookahead_m: float = 120.0
 
 
 @dataclass
@@ -73,8 +77,15 @@ class Autopilot:
     def __init__(self, lm: LaneMap, geom: TruckGeometry, steering_mode: str = "relative", *, lateral: bool = True,
                  longitudinal: bool = True, params: AutopilotParams | None = None,
                  lat_params: LateralParams | None = None, speed_params: SpeedParams | None = None,
-                 relative_gain: float = 0.42, relative_deadzone: float = 0.0):
+                 relative_gain: float = 0.42, relative_deadzone: float = 0.0, hazards: np.ndarray | None = None,
+                 pulse_steering: bool = False, check_pedals: bool = True):
+        """`pulse_steering`: relative steering as single-frame pulses (PulseModulator). Off by default: the
+        pedal loss it was meant to fix turned out to be the game taking one input event per frame (fixed in
+        the bridge DLL), and pulses spend that budget twice. `check_pedals`: fault when the game doesn't take them (off in shadow mode,
+        where nothing is sent)."""
+        """`hazards`: (n, 2) map points AutoHaul must not drive through itself, e.g. toll plazas."""
         self.lm = lm
+        self.hazards = np.empty((0, 2)) if hazards is None else np.asarray(hazards, dtype=float).reshape(-1, 2)
         self.geom = geom
         self.lateral_on = lateral
         self.longitudinal_on = longitudinal
@@ -83,7 +94,8 @@ class Autopilot:
         self.tracker = LaneTracker(lm)
         self.lat = LateralController(geom, lat_params)
         if steering_mode == "relative":
-            self.servo = RelativeServo(gain=relative_gain, deadzone=relative_deadzone)
+            self.servo = RelativeServo(gain=relative_gain, deadzone=relative_deadzone,
+                                       max_cmd=PulseModulator.MAX_AVERAGE if pulse_steering else 1.0)
         elif steering_mode == "absolute":
             self.servo = AbsoluteServo()
         else:
@@ -92,6 +104,10 @@ class Autopilot:
         self.pedals = PedalController(self.sp)
         self._lost = 0.0
         self._low_conf = 0.0
+        self.pulse = PulseModulator() if pulse_steering and steering_mode == "relative" else None
+        self.check_pedals = check_pedals
+        self._sent = Command()
+        self._pedal_miss = 0.0
         self.path: PathRef | None = None
 
     # ------------------------------------------------------------- engage
@@ -100,6 +116,10 @@ class Autopilot:
         self.tracker.reset()
         self.lat.reset()
         self.servo.reset()
+        if self.pulse:
+            self.pulse.reset()
+        self._sent = Command()
+        self._pedal_miss = 0.0
         self.pedals.reset(max(frame.speed, 0.0))
         self._lost = self._low_conf = 0.0
         if frame.speed < -0.2:
@@ -118,6 +138,31 @@ class Autopilot:
                 return f"{abs(st.lateral):.1f} m off the lane centre; centre the truck first"
             if abs(math.degrees(st.heading_err)) > self.p.engage_max_heading_deg:
                 return f"truck is {abs(math.degrees(st.heading_err)):.0f} deg off the lane direction"
+        if st is not None and len(self.hazards):
+            try:
+                path = PathRef(self.tracker.path_ahead(self.p.path_ahead_m))
+            except ValueError:
+                return "no path ahead on the lane map"
+            hz = self.hazard_ahead(path, path.project(pose.x, pose.y).s, max(frame.speed, 0.0))
+            if hz:
+                return hz.replace(": take over", "")
+        return None
+
+    def hazard_ahead(self, path: PathRef, s0: float, speed: float) -> str | None:
+        """A toll plaza (or other hazard point) on the path within the warning distance."""
+        if not len(self.hazards):
+            return None
+        horizon = max(self.p.hazard_lookahead_m, self.p.hazard_lookahead_s * speed)
+        x0, y0 = path.point(max(s0, 0.0))
+        near = self.hazards[np.hypot(self.hazards[:, 0] - x0, self.hazards[:, 1] - y0) < horizon + self.p.hazard_radius_m]
+        if not len(near):
+            return None
+        ss = np.arange(max(s0, 0.0), min(s0 + horizon, path.length) + 1e-9, 5.0)
+        pts = np.array([path.point(v) for v in ss])
+        d = np.hypot(pts[:, None, 0] - near[None, :, 0], pts[:, None, 1] - near[None, :, 1]).min(axis=1)
+        hit = np.flatnonzero(d < self.p.hazard_radius_m)
+        if len(hit):
+            return f"toll plaza ahead in {ss[hit[0]] - s0:.0f} m: take over"
         return None
 
     # ------------------------------------------------------------- step
@@ -137,6 +182,7 @@ class Autopilot:
             # hold the wheel (relative mode: command 0 keeps it where it is), coast
             self.pedals.reset(max(frame.speed, 0.0))
             out.timings_ms = {"track": (t1 - t0) * 1e3}
+            self._sent = cmd
             return cmd, out
         self._lost = 0.0
         out.lane, out.lane_desc, out.confidence = st.lane, self.lm.describe(st.lane), st.confidence
@@ -147,21 +193,30 @@ class Autopilot:
             path = self.path = PathRef(pts)
         except ValueError:                      # at the very end of a lane with no mapped continuation
             out.fault = "no path ahead on the lane map"
+            self._sent = cmd
             return cmd, out
         out.path_m = path.length
+        hz = self.hazard_ahead(path, path.project(pose.x, pose.y).s, max(frame.speed, 0.0))
+        if hz:
+            out.fault = hz
         t2 = clock()
 
         # --- lateral
-        rate = self.servo.gain * self.geom.rad_per_unit if isinstance(self.servo, RelativeServo) else None
+        rate = (self.servo.gain * self.servo.max_cmd * self.geom.rad_per_unit
+                if isinstance(self.servo, RelativeServo) else None)    # fastest the wheel turns, rad/s
         lat = self.lat.step(pose, path, dt, measured_steer_left(frame, self.geom), steer_rate=rate)
         out.ctrl_lateral, out.kappa_ff, out.curve_ratio = lat.lateral, lat.kappa_ff, lat.ratio
         target = max(-self.p.max_steer_units, min(self.p.max_steer_units, lat.steer_left / self.geom.rad_per_unit))
         out.steer_target = target
         if self.lateral_on:
             cmd.steer = self.servo.step(target, frame.effective_steering, dt)
+            if self.pulse:
+                cmd.steer = self.pulse.step(cmd.steer)
             out.steer_cmd = cmd.steer
             out.servo_gain = getattr(self.servo, "gain", 0.0)
-            if abs(st.lateral) > self.p.max_lateral_m:
+            if out.fault:
+                pass
+            elif abs(st.lateral) > self.p.max_lateral_m:
                 out.fault = f"{abs(st.lateral):.1f} m off the lane centre"
             elif self._low_conf > self.p.low_confidence_s:
                 out.fault = f"lane match uncertain for {self._low_conf:.1f} s"
@@ -190,7 +245,8 @@ class Autopilot:
             if path.length < self.p.path_ahead_m - 1:
                 stop_at = max(path.length - self.geom.front_bumper - self.p.lane_end_margin_m, s0)
             v_ahead, a_need, d_ahead, kind = self.planner.ahead(
-                path, s0, v, stop_at, steer_rate=rate, wheelbase=self.geom.wheelbase,
+                path, s0, v, stop_at, steer_rate=rate if self.lateral_on else None,   # driver steers: no limit
+                wheelbase=self.geom.wheelbase,
                 steer_now=-measured_steer_left(frame, self.geom))     # planner: map convention, + = right
             target_v, reason = limit, "limit" if frame.navigation_speed_limit > 0.5 else "no limit known"
             if self.sp.max_speed_kmh * KMH <= target_v:
@@ -211,10 +267,20 @@ class Autopilot:
             out.limit_kmh, out.target_kmh, out.target_reason, out.a_request = limit * 3.6, target_v * 3.6, reason, a_req
             cmd.throttle, cmd.brake = self.pedals.step(a_req, v, dt, emergency, v_cap=target_v)
             out.throttle, out.brake = cmd.throttle, cmd.brake
+            # the game must actually take the pedals we sent last frame (it silently ignores them while
+            # AutoHaul's steering axis is held non-zero, and controller mixes can cancel them)
+            if self.check_pedals:
+                sent = max(self._sent.throttle, self._sent.brake)
+                seen = frame.input_throttle if self._sent.throttle >= self._sent.brake else frame.input_brake
+                self._pedal_miss = self._pedal_miss + dt if sent > 0.2 and seen < 0.5 * sent - 0.05 else 0.0
+                if self._pedal_miss > self.p.pedal_miss_s and not out.fault:
+                    which = "throttle" if self._sent.throttle >= self._sent.brake else "brake"
+                    out.fault = f"the game isn't taking AutoHaul's {which} (sent {sent:.2f}, game shows {seen:.2f})"
             if out.fault and not emergency:
                 cmd.throttle = 0.0
         t4 = clock()
         out.timings_ms = {"track": (t1 - t0) * 1e3, "path": (t2 - t1) * 1e3, "lat": (t3 - t2) * 1e3, "long": (t4 - t3) * 1e3}
+        self._sent = cmd
         return cmd, out
 
     def steer_measured(self, frame) -> float:

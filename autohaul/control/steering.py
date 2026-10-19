@@ -77,6 +77,34 @@ class RelativeServo:
         return self._to_axis(cmd)
 
 
+class PulseModulator:
+    """Deliver a relative-steering axis command as pulses with a zero frame after each one.
+
+    Kept as an option (Autopilot(pulse_steering=True)). It was added when AutoHaul's pedals seemed to be
+    ignored while steering was held; the real cause was the game fetching one input event per frame and
+    the bridge DLL dropping the rest (fixed 2026-10-20). Relative steering integrates the axis, so pulses
+    of twice the value every other frame turn the wheel at the same average rate (limit +-0.5)."""
+
+    MAX_AVERAGE = 0.5
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.acc = 0.0
+        self.last_pulse = False
+
+    def step(self, cmd: float) -> float:
+        self.acc = _clamp(self.acc + _clamp(cmd, -self.MAX_AVERAGE, self.MAX_AVERAGE), -1.0, 1.0)
+        if self.last_pulse:
+            self.last_pulse = False
+            return 0.0
+        out = self.acc
+        self.acc = 0.0
+        self.last_pulse = out != 0.0
+        return out
+
+
 class AbsoluteServo:
     """Absolute steering mode: the axis *is* the wheel position (effective = -command)."""
 

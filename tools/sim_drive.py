@@ -26,6 +26,7 @@ from autohaul.infra.paths import map_dir, recordings_dir  # noqa: E402
 from autohaul.io.recorder import RecordingReader  # noqa: E402
 from autohaul.sim.truck import SimParams, TruckSim  # noqa: E402
 from autohaul.world.lanemap import LaneMap, heading_to_rotation  # noqa: E402
+from autohaul.world.pois import toll_plazas  # noqa: E402
 
 
 def start_from_recording(spec: str) -> tuple[float, float, float, float]:
@@ -59,7 +60,8 @@ def main() -> int:
     print(f"lane map loaded in {time.time() - t0:.1f} s")
     geom = TruckGeometry()
     sim = TruckSim(geom, SimParams(mass=args.mass), x=x, y=y, rotation=rot, speed=v0)
-    ap = Autopilot(lm, geom, "relative", speed_params=SpeedParams(max_speed_kmh=args.limit_kmh))
+    ap = Autopilot(lm, geom, "relative", speed_params=SpeedParams(max_speed_kmh=args.limit_kmh),
+                   hazards=toll_plazas(map_dir(cfg)))
     frame = sim.frame(args.limit_kmh / 3.6)
     reason = ap.engage(frame)
     if reason:

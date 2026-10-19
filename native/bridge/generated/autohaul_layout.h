@@ -5,8 +5,8 @@
 
 namespace autohaul {
 
-constexpr uint32_t kLayoutVersion = 1;
-constexpr uint64_t kLayoutHash = 0xd14fb5ed100d819aull;
+constexpr uint32_t kLayoutVersion = 2;
+constexpr uint64_t kLayoutHash = 0x7fc4e4f789ab30b3ull;
 constexpr uint32_t RING_SLOTS = 8;
 constexpr uint32_t EVENT_SLOTS = 64;
 constexpr uint32_t MAX_WHEELS = 16;
@@ -539,11 +539,14 @@ struct TelemetryHeader {
     uint64_t applied_write_seq;
     uint64_t watchdog_trips;
     uint64_t kill_count;
+    uint64_t input_calls;
+    uint64_t input_events_delivered;
+    uint64_t input_events_requeued;
     char game_name[32];
     char game_id[16];
     char bridge_version[16];
 };
-static_assert(sizeof(TelemetryHeader) == 224, "TelemetryHeader size");
+static_assert(sizeof(TelemetryHeader) == 248, "TelemetryHeader size");
 static_assert(offsetof(TelemetryHeader, magic) == 0, "TelemetryHeader.magic");
 static_assert(offsetof(TelemetryHeader, layout_version) == 4, "TelemetryHeader.layout_version");
 static_assert(offsetof(TelemetryHeader, layout_hash) == 8, "TelemetryHeader.layout_hash");
@@ -575,9 +578,12 @@ static_assert(offsetof(TelemetryHeader, last_input_qpc) == 128, "TelemetryHeader
 static_assert(offsetof(TelemetryHeader, applied_write_seq) == 136, "TelemetryHeader.applied_write_seq");
 static_assert(offsetof(TelemetryHeader, watchdog_trips) == 144, "TelemetryHeader.watchdog_trips");
 static_assert(offsetof(TelemetryHeader, kill_count) == 152, "TelemetryHeader.kill_count");
-static_assert(offsetof(TelemetryHeader, game_name) == 160, "TelemetryHeader.game_name");
-static_assert(offsetof(TelemetryHeader, game_id) == 192, "TelemetryHeader.game_id");
-static_assert(offsetof(TelemetryHeader, bridge_version) == 208, "TelemetryHeader.bridge_version");
+static_assert(offsetof(TelemetryHeader, input_calls) == 160, "TelemetryHeader.input_calls");
+static_assert(offsetof(TelemetryHeader, input_events_delivered) == 168, "TelemetryHeader.input_events_delivered");
+static_assert(offsetof(TelemetryHeader, input_events_requeued) == 176, "TelemetryHeader.input_events_requeued");
+static_assert(offsetof(TelemetryHeader, game_name) == 184, "TelemetryHeader.game_name");
+static_assert(offsetof(TelemetryHeader, game_id) == 216, "TelemetryHeader.game_id");
+static_assert(offsetof(TelemetryHeader, bridge_version) == 232, "TelemetryHeader.bridge_version");
 
 struct ControlsHeader {
     uint32_t magic;

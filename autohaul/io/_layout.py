@@ -3,8 +3,8 @@
 # ruff: noqa
 import ctypes
 
-LAYOUT_VERSION = 1
-LAYOUT_HASH = 0xd14fb5ed100d819a
+LAYOUT_VERSION = 2
+LAYOUT_HASH = 0x7fc4e4f789ab30b3
 RING_SLOTS = 8
 EVENT_SLOTS = 64
 MAX_WHEELS = 16
@@ -347,12 +347,15 @@ class TelemetryHeader(ctypes.Structure):
         ('applied_write_seq', ctypes.c_uint64),
         ('watchdog_trips', ctypes.c_uint64),
         ('kill_count', ctypes.c_uint64),
+        ('input_calls', ctypes.c_uint64),
+        ('input_events_delivered', ctypes.c_uint64),
+        ('input_events_requeued', ctypes.c_uint64),
         ('game_name', ctypes.c_char * 32),
         ('game_id', ctypes.c_char * 16),
         ('bridge_version', ctypes.c_char * 16),
     ]
 
-assert ctypes.sizeof(TelemetryHeader) == 224
+assert ctypes.sizeof(TelemetryHeader) == 248
 
 class ControlsHeader(ctypes.Structure):
     _fields_ = [

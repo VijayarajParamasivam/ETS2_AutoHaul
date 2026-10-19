@@ -11,6 +11,7 @@ driving keys stop it at once, as in Phase 1.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -26,7 +27,8 @@ from autohaul.control.steering import RelativeServo  # noqa: E402
 from autohaul.infra.gameenv import active_controls_file, controls_constants, steering_mode  # noqa: E402
 from autohaul.infra.paths import logs_dir  # noqa: E402
 from autohaul.infra.session import Session  # noqa: E402
-from autohaul.safety.supervisor import Command  # noqa: E402
+from autohaul.io.win32 import foreground_pid  # noqa: E402
+from autohaul.safety.supervisor import Command, Verdict  # noqa: E402
 
 LEVELS = [0.04, 0.08, 0.12, 0.16, 0.20, 0.30, 0.50]
 
@@ -55,31 +57,68 @@ def fit(cmds: np.ndarray, rates: np.ndarray) -> tuple[float, float, float]:
     return best
 
 
+def not_ready(s: Session, f) -> list[str]:
+    problems = []
+    if abs(f.speed) > 0.5 or not f.parking_brake:
+        problems.append("parking brake on, truck standing still")
+    if f.paused:
+        problems.append("game unpaused")
+    if foreground_pid() != s.reader.header().game_pid:
+        problems.append("game window focused")
+    return problems
+
+
+def wait_ready(s: Session, timeout_s: float) -> bool:
+    """Start by itself once the truck is parked and the game has focus (no console needed)."""
+    end = time.time() + timeout_s
+    last = None
+    while time.time() < end:
+        f = s.reader.wait_frame(200)
+        if f is None:
+            continue
+        missing = not_ready(s, f)
+        if missing != last:
+            print("waiting for: " + ", ".join(missing) if missing else "ready: starting in 2 s", flush=True)
+            last = missing
+        if not missing:
+            time.sleep(2.0)
+            return not not_ready(s, latest(s))
+    return False
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--wait-s", type=float, default=0.0,
+                        help="instead of ENTER + countdown, start once parked and the game has focus (wait up to N s)")
+    args = parser.parse_args()
     with Session("steer-ident", controls=True, record=True) as s:
         if not s.connect(10):
             print("game not running")
             return 1
-        f = latest(s)
-        problems = []
         if steering_mode(s.cfg) != "relative":
-            problems.append("this test is for RELATIVE steering mode (c_relatsteer 1)")
-        if abs(f.speed) > 0.5 or not f.parking_brake:
-            problems.append("park the truck and put the parking brake on")
-        if f.paused:
-            problems.append("unpause the game")
-        if problems:
-            print("Can't run:\n  - " + "\n  - ".join(problems))
+            print("Can't run: this test is for RELATIVE steering mode (c_relatsteer 1)")
             return 1
         prior = controls_constants(active_controls_file(s.cfg)).get("c_rsteersens", 0.42)
         s.safety.set_axes(steering=True, pedals=False)
-        countdown("STEERING RATE TEST: the wheel turns left and right at different speeds for ~1 s each, "
-                  "re-centring in between (about 40 s).")
+        if args.wait_s:
+            if not wait_ready(s, args.wait_s):
+                print("gave up waiting; nothing was sent to the game")
+                return 1
+        else:
+            missing = not_ready(s, latest(s))
+            missing = [m for m in missing if m != "game window focused"]
+            if missing:
+                print("Can't run, needs: " + ", ".join(missing))
+                return 1
+            countdown("STEERING RATE TEST: the wheel turns left and right at different speeds for ~1 s each, "
+                      "re-centring in between (about 40 s).")
         rows = []
         try:
             recentre(s, prior)
             for level in LEVELS:
                 for sign in (1, -1):
+                    if foreground_pid() != s.reader.header().game_pid:
+                        raise Aborted(Verdict(False, "the game window lost focus", "override", True))
                     trace = drive(s, 1.2, lambda t, f, v=sign * level: Command(steer=v))
                     pts = [(t, fr.effective_steering) for t, fr, _ in trace if t > 0.3]
                     if len(pts) > 10:

@@ -43,6 +43,11 @@ class SimParams:
     shift_every_kmh: float = 9.0      # automatic: a shift (0.6 s of no drive) every this many km/h
     shift_time_s: float = 0.6
     grade: float = 0.0                # rise / run, + = uphill (constant)
+    # Measured on 1.53.2.1 (bridge counters, 2026-10-20): the game fetches ONE input event per frame from
+    # AutoHaul's device. The bridge offers every changed input and re-offers what wasn't fetched, taking
+    # turns, so with steering and a pedal both changing each reaches the game every other frame.
+    events_per_frame: int = 1          # 0 = unlimited
+    ignore_pedals: bool = False        # tests: a game that never takes AutoHaul's pedals
 
 
 @dataclass
@@ -68,6 +73,10 @@ class TruckSim:
         self.frame_index = 0
         self._pending: deque[tuple[float, float, float]] = deque([(0.0, 0.0, 0.0)] * (self.p.input_delay_frames + 1))
         self.input_steering = 0.0
+        self.input_throttle = 0.0
+        self.input_brake = 0.0
+        self._game_inputs = [0.0, 0.0, 0.0]   # steering, throttle, brake as the game currently has them
+        self._rr = 0
         self.extra_steer_rate = 0.0       # tests: someone else turning the wheel (units/s)
         self.accel = 0.0
 
@@ -75,6 +84,19 @@ class TruckSim:
         p, s, g, dt = self.p, self.s, self.geom, self.p.dt
         self._pending.append((steer, throttle, brake))
         steer, throttle, brake = self._pending.popleft()
+        wanted = [steer, 0.0 if p.ignore_pedals else throttle, 0.0 if p.ignore_pedals else brake]
+        if p.events_per_frame <= 0:
+            self._game_inputs = wanted
+        else:
+            budget = p.events_per_frame
+            for k in range(3):
+                i = (self._rr + k) % 3
+                if budget and abs(wanted[i] - self._game_inputs[i]) > 1e-6:
+                    self._game_inputs[i] = wanted[i]
+                    budget -= 1
+                    self._rr = (i + 1) % 3
+        steer, throttle, brake = self._game_inputs
+        self.input_throttle, self.input_brake = max(0.0, min(1.0, throttle)), max(0.0, min(1.0, brake))
         # --- steering
         if p.steering_mode == "relative":
             a = steer
@@ -139,7 +161,8 @@ class TruckSim:
             local_linear_velocity=SimpleNamespace(x=0.0, y=0.0, z=-s.speed),
             local_linear_acceleration=SimpleNamespace(x=0.0, y=0.0, z=-self.accel),
             speed=s.speed, effective_steering=s.eff, input_steering=self.input_steering,
-            effective_throttle=s.thr, effective_brake=s.brk, input_throttle=s.thr, input_brake=s.brk,
+            effective_throttle=s.thr, effective_brake=s.brk, input_throttle=self.input_throttle,
+            input_brake=self.input_brake,
             wheel_steering=[wl / TWO_PI, wr / TWO_PI, 0.0, 0.0],
             navigation_speed_limit=speed_limit, parking_brake=0, engine_enabled=1, electric_enabled=1,
             displayed_gear=1 if s.speed >= 0 else -1, cruise_control=0.0, multiplayer_time_offset=0,

@@ -40,6 +40,7 @@ from autohaul.safety.keys import VK_NAME, vk  # noqa: E402
 from autohaul.safety.mp_guard import multiplayer_reasons  # noqa: E402
 from autohaul.safety.supervisor import Command  # noqa: E402
 from autohaul.world.lanemap import LaneMap  # noqa: E402
+from autohaul.world.pois import toll_plazas  # noqa: E402
 
 
 def beep(pattern: str, enabled: bool = True) -> None:
@@ -175,9 +176,10 @@ class Driver:
         return "full" if self.lateral and self.longitudinal else ("steer" if self.lateral else "speed")
 
     # ------------------------------------------------------------- loop
-    def run(self) -> None:
+    def run(self, minutes: float = 0.0) -> None:
         s = self.s
-        while True:
+        end = time.monotonic() + minutes * 60 if minutes else None
+        while end is None or time.monotonic() < end:
             f = s.reader.wait_frame(100)
             now = time.monotonic()
             presses = s.keyboard.state.press_count(self.engage_vk)
@@ -257,6 +259,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=["speed", "steer", "full"], default="full")
     parser.add_argument("--max-kmh", type=float, help="override drive.max_speed_kmh")
     parser.add_argument("--no-record", action="store_true")
+    parser.add_argument("--minutes", type=float, default=0.0, help="quit after this long (0 = until Ctrl+C)")
     args = parser.parse_args()
     lateral = args.mode in ("steer", "full")
     longitudinal = args.mode in ("speed", "full")
@@ -282,7 +285,7 @@ def main() -> int:
             sp.max_speed_kmh = args.max_kmh
         ap = Autopilot(lm, geom, mode, lateral=lateral, longitudinal=longitudinal, speed_params=sp,
                        relative_gain=consts.get("c_rsteersens", 0.42),
-                       relative_deadzone=d.get("relative_deadzone", 0.0))
+                       relative_deadzone=d.get("relative_deadzone", 0.0), hazards=toll_plazas(map_dir(cfg)))
         s.safety.set_axes(steering=lateral, pedals=longitudinal)
         s.safety.reset()
         drv = Driver(s, ap, lateral, longitudinal)
@@ -294,10 +297,13 @@ def main() -> int:
         print(f"mode {args.mode}: press {d.get('engage_key', 'SLASH')} in the game to engage / hand back. "
               f"Taking over: {keys}, controller, kill key. Ctrl+C here to quit.\n")
         try:
-            drv.run()
+            drv.run(args.minutes)
         except KeyboardInterrupt:
             pass
         finally:
+            if drv.engaged:
+                drv.disengage("AutoHaul stopped (time limit / quit)", fault=True)
+                time.sleep(0.6)                      # let the alarm beep play
             st = drv.stats
             print(f"\n\nengaged {st['engagements']}x, {st['engaged_s'] / 60:.1f} min, {st['engaged_km']:.2f} km; "
                   f"faults: {st['faults'] or 'none'}")

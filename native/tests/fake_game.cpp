@@ -283,6 +283,8 @@ void send_channels(int frame) {
     }
 }
 
+int g_events_per_frame = 0;   // 0 = unlimited (SDK contract); N = the game fetches at most N events per frame
+
 void poll_input(int frame, bool after_activation) {
     if (!g_have_device) {
         return;
@@ -292,6 +294,9 @@ void poll_input(int frame, bool after_activation) {
         flags |= SCS_INPUT_EVENT_CALLBACK_FLAG_first_after_activation;
     }
     for (int guard = 0; guard < 1000; ++guard) {
+        if (g_events_per_frame > 0 && guard >= g_events_per_frame) {
+            break;
+        }
         scs_input_event_t ev{};
         const scs_result_t r = g_device.input_event_callback(&ev, flags, g_device.callback_context);
         if (r == SCS_RESULT_not_found) {
@@ -338,6 +343,7 @@ int main(int argc, char** argv) {
         else if (a == "--parked") g_sim.parked = true;
         else if (a == "--telemetry-only") telemetry_only = true;
         else if (a == "--convoy") g_sim.convoy = true;
+        else if (a == "--events-per-frame") g_events_per_frame = std::atoi(next());
     }
 
     HMODULE dll = LoadLibraryA(argv[1]);

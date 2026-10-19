@@ -26,7 +26,7 @@ import numpy as np
 LANE_WIDTH = 4.5          # m, standard SCS lane
 SAMPLE_STEP = 6.0         # m between samples on gentle curves
 GRID_CELL = 64.0          # m
-CACHE_VERSION = 2          # 2: road lanes placed by prefab-calibrated look layouts
+CACHE_VERSION = 3          # 3: hidden (non-drivable) roads and prefabs left out; 2: calibrated look layouts
 
 KIND_ROAD = 0
 KIND_PREFAB = 1
@@ -412,8 +412,8 @@ class LaneMap:
         prefab_lanes = []                   # (pts, z0, z1, uid, curve index), added after the roads
         for pf in load("prefabs"):
             desc = descs.get(pf["token"])
-            if not desc or not desc.get("navCurves") or not pf.get("nodeUids"):
-                continue
+            if pf.get("hidden") or not desc or not desc.get("navCurves") or not pf.get("nodeUids"):
+                continue      # hidden items are not drivable in the game (closed / superseded pieces)
             origin = nodes.get(pf["nodeUids"][0])
             if origin is None:
                 continue
@@ -438,7 +438,7 @@ class LaneMap:
         log(f"  {len(prefab_lanes)} prefab lanes")
 
         log("calibrating road looks from prefab connections ...")
-        roads = load("roads")
+        roads = [rd for rd in load("roads") if not rd.get("hidden")]   # hidden = not drivable (closed road)
         layouts = calibrate_looks(roads, nodes, looks, prefab_lanes)
         n_cal = sum(1 for v in layouts.values() if v[2] == "prefab evidence")
         log(f"  {n_cal} of {len(layouts)} road looks calibrated from prefab connections, the rest by rule")

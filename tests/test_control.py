@@ -48,6 +48,36 @@ def test_relative_servo_tracks_and_learns_the_rate():
     assert not servo.fighting
 
 
+def test_pulse_modulator_never_steers_two_frames_running_and_keeps_the_average():
+    from autohaul.control.steering import PulseModulator
+    pm = PulseModulator()
+    cmds = [0.3] * 50 + [-0.45] * 50 + [0.8] * 50 + [0.02] * 50
+    out = [pm.step(c) for c in cmds]
+    assert all(not (a and b) for a, b in zip(out, out[1:]))
+    # nothing is lost: the delivered total matches the (0.5-capped) commands to within one frame
+    wanted = sum(max(-0.5, min(0.5, c)) for c in cmds)
+    assert sum(out) == pytest.approx(wanted, abs=0.5)
+    assert sum(out[10:50]) == pytest.approx(0.3 * 40, abs=0.61)
+    assert max(abs(o) for o in out) <= 1.0
+
+
+@pytest.mark.parametrize("pulse", [False, True])
+def test_full_mode_with_one_input_event_per_frame(highway, pulse):
+    """The game takes one input change per frame (measured 2026-10-20): steering and pedals share it."""
+    sim = sim_at(highway, 50, y0=0.3, events_per_frame=1)
+    log = run(Autopilot(highway.lm, GEOM, "relative", pulse_steering=pulse), sim, highway, 60, speed_limit=80 * KMH)
+    assert log.fault is None
+    assert log.arr("speed").max() * 3.6 > 75                      # accelerated to the limit
+    assert np.abs(log.arr("lateral"))[log.arr("t") > 8].max() < 0.4
+
+
+def test_hands_back_when_the_game_ignores_the_pedals(highway):
+    sim = sim_at(highway, 50, y0=0.3, ignore_pedals=True)
+    log = run(Autopilot(highway.lm, GEOM, "relative"), sim, highway, 30, speed_limit=80 * KMH)
+    assert log.fault and log.fault.startswith("the game isn't taking AutoHaul's throttle")
+    assert log.t[-1] < 3.0
+
+
 def test_servo_notices_someone_else_turning_the_wheel(highway):
     sim = sim_at(highway, 70)
     ap = Autopilot(highway.lm, GEOM, "relative")
@@ -160,7 +190,35 @@ def test_hands_back_well_before_a_junction_sharp_turn():
     sim = sim_at(course, 70)
     log = run(Autopilot(course.lm, GEOM, "relative"), sim, course, 60, speed_limit=80 * KMH)
     assert log.fault and log.fault.startswith("sharp turn ahead")
-    assert 500 - log.s_end > 60                    # at least ~3 s of warning at that speed
+    warning_s = (500 - log.s_end) / max(log.arr("speed")[-1], 1.0)
+    assert warning_s > 4.0                         # seconds of warning at the speed it handed back
+
+
+def test_hands_back_before_a_toll_plaza_and_refuses_to_engage_there():
+    course = Course.from_pieces([(1200, 0.0)], two_lanes=False)
+    toll = np.array([[650.0, 25.0]])                    # plaza icon beside the road, 25 m off the lane
+    sim = sim_at(course, 70)
+    log = run(Autopilot(course.lm, GEOM, "relative", hazards=toll), sim, course, 60, speed_limit=80 * KMH)
+    assert log.fault and log.fault.startswith("toll plaza ahead")
+    assert 650 - log.s_end > 120                       # handed back well before it
+    near = sim_at(course, 30, s0=600)
+    assert "toll plaza" in Autopilot(course.lm, GEOM, "relative", hazards=toll).engage(near.frame())
+    for mode in (dict(lateral=False), dict(longitudinal=False)):   # speed-only and steer-only too
+        sim = sim_at(course, 70)
+        log = run(Autopilot(course.lm, GEOM, "relative", hazards=toll, **mode), sim, course, 60, speed_limit=80 * KMH)
+        assert log.fault and log.fault.startswith("toll plaza ahead")
+
+
+def test_speed_only_mode_ignores_the_drivers_wheel_angle():
+    """Regression (2026-10-19 drive): in speed-only mode the driver's normal steering corrections made
+    the steering-rate check demand ~11 km/h on an 800 m curve."""
+    course = Course.from_pieces([(200, 0.0), (400, 1 / 800)], two_lanes=False)
+    sim = sim_at(course, 50)
+    ap = Autopilot(course.lm, GEOM, "relative", lateral=False)
+    assert ap.engage(sim.frame(80 * KMH)) is None
+    sim.s.eff = 0.09                                    # driver holding ~3.4 deg more wheel than the curve needs
+    _, st = ap.step(sim.frame(80 * KMH), [], sim.p.dt)
+    assert st.target_kmh > 70
 
 
 def test_steering_rate_limits_curve_speed():

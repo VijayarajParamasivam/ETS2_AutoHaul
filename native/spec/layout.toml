@@ -9,7 +9,7 @@
 # Field types: u8 u16 u32 u64 s32 s64 f32 f64, char[N], <type>[N], or a struct name (optionally [N]).
 # N may be a literal or a constant from [constants].
 
-version = 1
+version = 2
 
 [constants]
 RING_SLOTS = 8          # telemetry frames kept in the ring
@@ -270,6 +270,9 @@ fields = [
   ["applied_write_seq", "u64"],                        # newest controls write_seq the game has seen
   ["watchdog_trips", "u64"],
   ["kill_count", "u64"],
+  ["input_calls", "u64"],                              # input event callback calls by the game
+  ["input_events_delivered", "u64"],                   # events the game actually fetched
+  ["input_events_requeued", "u64"],                    # events offered but not fetched in their frame
   ["game_name", "char[32]"], ["game_id", "char[16]"], ["bridge_version", "char[16]"],
 ]
 

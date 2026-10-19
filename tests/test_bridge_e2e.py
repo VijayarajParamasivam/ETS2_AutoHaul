@@ -144,6 +144,34 @@ def test_controls_axes_holds_and_pulses():
     assert game.values("steering")[-1][1] == 0 and game.values("horn")[-1][1] == 0
 
 
+def test_game_taking_one_event_per_frame_still_gets_every_input():
+    """1.53.2.1 was seen to drop AutoHaul's throttle/brake while steering changed every frame: the game took
+    fewer events than offered and the DLL treated the rest as delivered. Unfetched events must be re-offered."""
+    with FakeGame("--events-per-frame", "1", frames=600, hz=120) as game:
+        reader = connect(game)
+        with Controls(game.suffix) as ctl:
+            ctl.set_enabled(True)
+            ctl.throttle(0.3)
+            ctl.press("lblinker", 1)
+            k, stop = 0, time.time() + 1.5
+            while time.time() < stop:
+                k += 1
+                ctl.steer(0.1 if k % 2 else -0.1)          # steering changes on every commit
+                if k == 60:
+                    ctl.brake(0.2)
+                ctl.commit()
+                time.sleep(0.005)
+            hdr = reader.header()
+            requeued, delivered = hdr.input_events_requeued, hdr.input_events_delivered
+        game.wait_done()
+    assert any(abs(v - 0.3) < 1e-6 for _, v in game.values("aforward"))
+    assert any(abs(v - 0.2) < 1e-6 for _, v in game.values("abackward"))
+    assert [v for _, v in game.values("lblinker")][:2] == [1, 0]      # pulse: pressed, then released
+    assert requeued > 0 and delivered > 0                              # the fake game really refused extras
+    for name in ("aforward", "abackward", "steering"):                 # close() released everything
+        assert game.values(name)[-1][1] == 0
+
+
 def test_watchdog_releases_after_heartbeat_loss():
     with FakeGame(frames=480, hz=120) as game:
         reader = connect(game)

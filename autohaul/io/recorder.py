@@ -9,6 +9,7 @@ events and notes are JSON.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import struct
 import time
@@ -30,12 +31,24 @@ _REC = struct.Struct("<BdI")
 _CHUNK = struct.Struct("<I")
 
 
+def struct_fingerprint(cls) -> str:
+    """Field names/types/offsets of a ctypes structure: recordings stay readable across layout
+    changes that don't touch the recorded structures (e.g. new header counters)."""
+    import hashlib
+    desc = repr([(n, getattr(cls, n).offset, getattr(cls, n).size) for n, *_ in cls._fields_]) + str(ctypes.sizeof(cls))
+    return hashlib.sha1(desc.encode()).hexdigest()[:16]
+
+
+_RECORDED = {"frame": L.TelemetryFrame, "config": L.ConfigBlock, "controls": L.ControlsBlock}
+
+
 class Recorder:
     def __init__(self, path: Path, meta: dict[str, Any] | None = None, flush_every: int = 120):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.f = open(self.path, "wb")
         header = {"layout_version": L.LAYOUT_VERSION, "layout_hash": f"0x{L.LAYOUT_HASH:016x}",
+                  "structs": {k: struct_fingerprint(c) for k, c in _RECORDED.items()},
                   "created": time.time(), **(meta or {})}
         self.f.write(MAGIC)
         self.f.write(json.dumps(header).encode() + b"\n")
@@ -96,14 +109,20 @@ class Record:
     t: float
     payload: bytes
 
+    def _decode(self, cls):
+        if len(self.payload) != ctypes.sizeof(cls):
+            raise ValueError(f"recorded {cls.__name__} is {len(self.payload)} bytes, this package's is "
+                             f"{ctypes.sizeof(cls)}: recorded with an incompatible layout")
+        return cls.from_buffer_copy(self.payload)
+
     def frame(self) -> L.TelemetryFrame:
-        return L.TelemetryFrame.from_buffer_copy(self.payload)
+        return self._decode(L.TelemetryFrame)
 
     def config(self) -> L.ConfigBlock:
-        return L.ConfigBlock.from_buffer_copy(self.payload)
+        return self._decode(L.ConfigBlock)
 
     def controls(self) -> L.ControlsBlock:
-        return L.ControlsBlock.from_buffer_copy(self.payload)
+        return self._decode(L.ControlsBlock)
 
     def json(self) -> dict[str, Any]:
         return json.loads(self.payload)
@@ -117,9 +136,15 @@ class RecordingReader:
                 raise ValueError(f"{path}: not an AutoHaul recording")
             self.meta = json.loads(f.readline())
             self._data_start = f.tell()
-        if self.meta.get("layout_hash") != f"0x{L.LAYOUT_HASH:016x}":
-            raise ValueError(f"{path}: recorded with layout {self.meta.get('layout_hash')}, "
-                             f"this package uses 0x{L.LAYOUT_HASH:016x}")
+        # A different overall layout is fine as long as the recorded structures are unchanged: exact
+        # fingerprints when the file has them, otherwise (older files) exact sizes, checked per record.
+        self.layout_mismatch = self.meta.get("layout_hash") != f"0x{L.LAYOUT_HASH:016x}"
+        recorded = self.meta.get("structs")
+        if self.layout_mismatch and recorded:
+            bad = [k for k, c in _RECORDED.items() if recorded.get(k) != struct_fingerprint(c)]
+            if bad:
+                raise ValueError(f"{path}: recorded with layout {self.meta.get('layout_hash')}; its "
+                                 f"{', '.join(bad)} structures differ from this package's")
 
     def __iter__(self) -> Iterator[Record]:
         with open(self.path, "rb") as f:
