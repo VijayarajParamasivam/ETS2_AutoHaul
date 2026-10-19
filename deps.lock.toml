@@ -7,7 +7,10 @@ repo = "https://github.com/ETS2LA/plugin.git"
 commit = "c328dc3807cf8e37d0f109a04f3827b7508a0d08"   # 2025-03-12, last before "update data structures for 1.54"
 submodules = true
 license = "MIT"
-patches = ["patches/ets2la_plugin/0001-disable-steering-hook.patch"]
+patches = [
+  "patches/ets2la_plugin/0001-disable-steering-hook.patch",
+  "patches/ets2la_plugin/0002-guard-readers-disable-traffic-objects.patch",  # traffic_objects crashes 1.53.2.1
+]
 
 [trucksim_maps]
 repo = "https://github.com/truckermudgeon/maps.git"

@@ -1,0 +1,107 @@
+diff --git a/src/core.cpp b/src/core.cpp
+index 67ee453..07dae8a 100644
+--- a/src/core.cpp
++++ b/src/core.cpp
+@@ -1,6 +1,7 @@
+ ﻿#include "core.hpp"
+ 
+ #include <MinHook.h>
++#include <cstring>
+ 
+ #include "consts.hpp"
+ 
+@@ -728,12 +729,90 @@ namespace ets2_la_plugin
+         }
+     }
+ 
++    namespace
++    {
++        using reader_fn = void (CCore::*)() const;
++
++        // AutoHaul: SEH guard. This function holds no C++ objects that need unwinding, so __try is
++        // allowed here. A reader that hits an access violation (struct offsets that don't match the
++        // running game build) is switched off instead of crashing the game.
++        bool run_guarded(const CCore *self, reader_fn fn, bool force_fault)
++        {
++            __try
++            {
++                if (force_fault)
++                {
++                    // Test hook (AUTOHAUL_TEST_FAULT_READER): proves the guard catches an access violation.
++                    volatile int *bad = nullptr;
++                    (void)*bad;
++                }
++                (self->*fn)();
++                return true;
++            }
++            __except (EXCEPTION_EXECUTE_HANDLER)
++            {
++                return false;
++            }
++        }
++    }
++
+     void CCore::tick() const
+     {
+-        this->get_camera_data();
+-        this->get_ai_traffic_data();
+-        this->get_traffic_objects_data();
+-        this->get_navigation_data();
++        // AutoHaul (1.53.2.1): get_traffic_objects_data crashes with an access violation on the first
++        // frame in the world (base_ctrl kdop item layout differs), so it is not called at all. The other
++        // readers run guarded and are disabled for the session on their first fault.
++        // A reader that is slow on many consecutive frames is almost certainly re-scanning game memory
++        // for a pattern it can't find (failed scans are not cached); it is disabled to protect the FPS.
++        constexpr double kSlowMs = 8.0;
++        constexpr int kSlowFrames = 10;
++        struct Reader
++        {
++            const char *name;
++            reader_fn fn;
++            bool enabled;
++            int slow_streak;
++        };
++        static Reader readers[] = {
++            {"camera", &CCore::get_camera_data, true, 0},
++            {"ai_traffic", &CCore::get_ai_traffic_data, true, 0},
++            {"traffic_objects", &CCore::get_traffic_objects_data, false, 0},
++            {"navigation", &CCore::get_navigation_data, true, 0},
++        };
++        static bool announced = false;
++        static char fault_reader[32] = {};
++        static LARGE_INTEGER qpf = {};
++        if (!announced)
++        {
++            announced = true;
++            QueryPerformanceFrequency(&qpf);
++            GetEnvironmentVariableA("AUTOHAUL_TEST_FAULT_READER", fault_reader, sizeof fault_reader);
++            this->info("AutoHaul guard: traffic_objects reader disabled (crashes on 1.53.2.1); camera, ai_traffic, navigation guarded");
++        }
++        for (auto &reader : readers)
++        {
++            if (!reader.enabled)
++            {
++                continue;
++            }
++            LARGE_INTEGER t0, t1;
++            QueryPerformanceCounter(&t0);
++            const bool ok = run_guarded(this, reader.fn, std::strcmp(fault_reader, reader.name) == 0);
++            QueryPerformanceCounter(&t1);
++            if (!ok)
++            {
++                reader.enabled = false;
++                this->error("AutoHaul guard: {} reader faulted (access violation), disabled for this session", reader.name);
++                continue;
++            }
++            const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(qpf.QuadPart);
++            reader.slow_streak = ms > kSlowMs ? reader.slow_streak + 1 : 0;
++            if (reader.slow_streak >= kSlowFrames)
++            {
++                reader.enabled = false;
++                this->error("AutoHaul guard: {} reader took over {} ms on {} frames in a row (memory pattern not found?), disabled",
++                            reader.name, kSlowMs, kSlowFrames);
++            }
++        }
+ 
+         // Get steering data from the shared memory file
+         InputMemData data = this->read_input_mem();

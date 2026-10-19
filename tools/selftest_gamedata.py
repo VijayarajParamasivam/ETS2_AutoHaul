@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -27,7 +28,34 @@ from autohaul.io import _layout as L  # noqa: E402
 from autohaul.io.gamedata import GameDataReader  # noqa: E402
 from autohaul.io.telemetry import channel_seen, text  # noqa: E402
 
-EXPECTED_MISSING_ON_153 = {"mandatory.break"}
+# Channels ETS2 1.53.2.1 doesn't provide (game.log: "lookup_channel: channel ... not found").
+EXPECTED_MISSING_ON_153 = {"mandatory.break", "truck.adblue.consumption.average"}
+
+
+GUARD_RE = re.compile(r"AutoHaul guard: (\w+) reader (faulted.*|took over.*)")
+# Which self-test check each guarded plugin reader feeds.
+READER_CHECK = {"camera": "ets2la: camera", "ai_traffic": "ets2la: traffic",
+                "traffic_objects": "ets2la: traffic lights", "navigation": "ets2la: route"}
+
+
+def plugin_log(cfg) -> list[str]:
+    try:
+        text_ = game_log(cfg).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [f"(cannot read game.log.txt: {exc})"]
+    return [ln.strip() for ln in text_.splitlines() if "[autohaul]" in ln or "[ets2_la_plugin]" in ln]
+
+
+def guard_events(lines: list[str]) -> dict[str, str]:
+    """reader name -> why the AutoHaul guard in the ETS2LA plugin switched it off."""
+    out = {}
+    for ln in lines:
+        m = GUARD_RE.search(ln)
+        if m:
+            out[m.group(1)] = m.group(2)
+        elif "traffic_objects reader disabled" in ln:
+            out.setdefault("traffic_objects", "disabled by design: crashes the game on 1.53.2.1")
+    return out
 
 
 @dataclass
@@ -136,10 +164,13 @@ def main() -> int:
         hz = 1000.0 / st["mean"] if st["n"] else 0.0
         checks.append(Check("bridge: frame rate", "PASS" if hz >= 55 else ("WARN" if hz >= 30 else "FAIL"),
                             f"{hz:.1f} Hz over {frames} frames, interval p95 {st['p95']:.1f} ms, max {st['max']:.1f} ms"))
-        never = []
+        never, explained = [], []
         if last_f is not None:
             cfg = s.reader.read_config()
             wheels = cfg.truck.wheel_count if cfg else 0
+            has_trailer = bool(cfg and cfg.trailers[0].present) or bool(last_f.trailers[0].connected)
+            has_job = bool(cfg and cfg.job.present)
+            hshifter = bool(cfg and text(cfg.controls.shifter_type) == "hshifter")
             for cid, sdk, index, _t, _field in L.CHANNELS:
                 if seen_bits[cid // 64] & (1 << (cid % 64)):
                     continue
@@ -147,10 +178,15 @@ def main() -> int:
                     continue
                 if sdk.startswith("trailer.") and not sdk.startswith("trailer.0."):
                     continue
-                never.append(sdk if index is None else f"{sdk}[{index}]")
-        unexpected = [c for c in never if c not in EXPECTED_MISSING_ON_153]
-        checks.append(Check("bridge: channels", "PASS" if not unexpected else "WARN",
-                            f"never received: {', '.join(never) or 'none'} (mandatory.break is expected to be missing on 1.53)"))
+                name = sdk if index is None else f"{sdk}[{index}]"
+                if (sdk in EXPECTED_MISSING_ON_153 or (sdk.startswith("trailer.0.") and not has_trailer)
+                        or (sdk == "job.cargo.damage" and not has_job) or (sdk == "truck.hshifter.slot" and not hshifter)):
+                    explained.append(name)
+                else:
+                    never.append(name)
+        checks.append(Check("bridge: channels", "PASS" if not never else "WARN",
+                            f"never received: {', '.join(never) or 'none'}"
+                            + (f" | expected now (not in 1.53, no trailer/job, or no H-shifter): {len(explained)}" if explained else "")))
         cfg = s.reader.read_config()
         checks.append(Check("bridge: truck config", "PASS" if cfg and cfg.truck.present else "FAIL",
                             f"{text(cfg.truck.brand)} {text(cfg.truck.name)}, {cfg.truck.wheel_count} wheels" if cfg else "no config"))
@@ -190,15 +226,16 @@ def main() -> int:
                                     f"agree in {good}/{len(route_vs_nav)} samples"))
         gd.close()
 
-    # ---- game log
-    log_lines = []
-    try:
-        for line in game_log(s.cfg).read_text(encoding="utf-8", errors="replace").splitlines():
-            if "[autohaul]" in line or "[ets2_la_plugin]" in line:
-                log_lines.append(line.strip())
-    except OSError as exc:
-        log_lines.append(f"(cannot read game.log.txt: {exc})")
-    plugin_errors = [ln for ln in log_lines if "error" in ln.lower() or "could not" in ln.lower()]
+    # ---- game log (+ the AutoHaul guard inside the ETS2LA plugin)
+    log_lines = plugin_log(s.cfg)
+    for reader, why in guard_events(log_lines).items():
+        name = READER_CHECK.get(reader)
+        for i, c in enumerate(checks):
+            if c.name == name:
+                status = "SKIP" if why.startswith("disabled by design") else "FAIL"
+                checks[i] = Check(c.name, status, f"reader switched off by the AutoHaul guard: {why}")
+    plugin_errors = [ln for ln in log_lines if ("error" in ln.lower() or "could not" in ln.lower())
+                     and "AutoHaul guard" not in ln]
     checks.append(Check("game.log", "WARN" if plugin_errors else "PASS",
                         f"{len(log_lines)} plugin lines" + (f"; problems: {plugin_errors[:3]}" if plugin_errors else "")))
 

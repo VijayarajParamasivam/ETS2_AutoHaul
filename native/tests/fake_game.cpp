@@ -3,7 +3,7 @@
 //
 //   fake_game.exe <dll> [--frames N] [--hz H] [--game-version MAJOR.MINOR] [--drop CHANNEL]...
 //                       [--kill-at FRAME] [--kill-frames N] [--pause-at FRAME] [--resume-at FRAME]
-//                       [--parked] [--convoy]
+//                       [--parked] [--convoy] [--telemetry-only]
 //
 // stdout protocol (one line each, flushed every frame):
 //   READY                      after both SDK inits succeeded
@@ -320,6 +320,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     int frames = 300, hz = 60, kill_at = -1, kill_frames = 10, pause_at = -1, resume_at = -1;
+    bool telemetry_only = false;  // load any telemetry-only plugin (e.g. ets2_la_plugin.dll)
     unsigned major = 1, minor = 18;
     g_drop.insert("mandatory.break");  // like 1.53 (telemetry game version 1.18)
     for (int i = 2; i < argc; ++i) {
@@ -335,6 +336,7 @@ int main(int argc, char** argv) {
         else if (a == "--pause-at") pause_at = std::atoi(next());
         else if (a == "--resume-at") resume_at = std::atoi(next());
         else if (a == "--parked") g_sim.parked = true;
+        else if (a == "--telemetry-only") telemetry_only = true;
         else if (a == "--convoy") g_sim.convoy = true;
     }
 
@@ -352,7 +354,7 @@ int main(int argc, char** argv) {
     auto iinit = reinterpret_cast<iinit_t>(GetProcAddress(dll, "scs_input_init"));
     auto ishut = reinterpret_cast<shut_t>(GetProcAddress(dll, "scs_input_shutdown"));
     auto force_kill = reinterpret_cast<kill_t>(GetProcAddress(dll, "autohaul_test_force_kill_key"));
-    if (!tinit || !tshut || !iinit || !ishut || !force_kill) {
+    if (!tinit || !tshut || (!telemetry_only && (!iinit || !ishut || !force_kill))) {
         std::fprintf(stderr, "missing exports\n");
         return 1;
     }
@@ -375,7 +377,7 @@ int main(int argc, char** argv) {
     ip.common = tp.common;
     ip.common.game_version = SCS_MAKE_VERSION(1, 0);
     ip.register_device = fake_register_device;
-    if (iinit(SCS_INPUT_VERSION_1_00, &ip) != SCS_RESULT_ok) {
+    if (!telemetry_only && iinit(SCS_INPUT_VERSION_1_00, &ip) != SCS_RESULT_ok) {
         std::fprintf(stderr, "input init failed\n");
         return 1;
     }
@@ -392,9 +394,10 @@ int main(int argc, char** argv) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
     bool after_activation = true;
+    double fe_total_us = 0.0, fe_max_us = 0.0;
     for (int f = 1; f <= frames; ++f) {
-        if (f == kill_at) force_kill(1);
-        if (kill_at > 0 && f == kill_at + kill_frames) force_kill(0);
+        if (force_kill && f == kill_at) force_kill(1);
+        if (force_kill && kill_at > 0 && f == kill_at + kill_frames) force_kill(0);
         if (f == pause_at) fire(SCS_TELEMETRY_EVENT_paused, nullptr);
         if (f == resume_at) fire(SCS_TELEMETRY_EVENT_started, nullptr);
 
@@ -415,7 +418,13 @@ int main(int argc, char** argv) {
         if (f == frames / 2) {
             send_config("job", {});  // job finished: empty attribute list
         }
+        LARGE_INTEGER fe0, fe1;
+        QueryPerformanceCounter(&fe0);
         fire(SCS_TELEMETRY_EVENT_frame_end, nullptr);
+        QueryPerformanceCounter(&fe1);
+        const double fe_us = static_cast<double>(fe1.QuadPart - fe0.QuadPart) * 1e6 / static_cast<double>(freq.QuadPart);
+        fe_total_us += fe_us;
+        if (fe_us > fe_max_us) fe_max_us = fe_us;
 
         poll_input(f, after_activation);
         after_activation = false;
@@ -432,7 +441,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    ishut();
+    std::printf("TIMING frame_end avg_us %.1f max_us %.1f\n", fe_total_us / frames, fe_max_us);
+    if (!telemetry_only) ishut();
     tshut();
     FreeLibrary(dll);
     std::printf("DONE\n");

@@ -31,6 +31,10 @@ Target: ETS2 **1.53.2.1**, single-player. Status 2026-10-19: built and tested wi
 | Override: driving key | Detected 0.7 ms after the press |
 | Override: telemetry cross-check (keyboard hook off) | Foreign steering detected ~70 ms after it started |
 | Not yet working | The `engine` button doesn't stop the engine (pulse or hold). To investigate in Phase 2 |
+| ETS2LA plugin, unmodified pin | **Crashed the game** on Drive (twice): access violation in `get_traffic_objects_data`, the traffic-light/gate reader |
+| ETS2LA plugin + patch 0002 (traffic-light reader off, other readers SEH-guarded) | Loads and runs. **Camera** PASS (283/283 plausible). **AI traffic** PASS: 20 vehicles at once, sizes realistic, reported speeds match measured movement exactly. **Traffic lights**: off (needs vision in Phase 3). **Route**: pending a drive with an active GPS route |
+
+**Steering mode:** the Phase 1 control checks ran with absolute steering (`c_relatsteer 0`). For your manual keyboard driving, the profile is back on relative steering (`c_relatsteer 1`; backups in `%USERPROFILE%\AutoHaul\backups\`). With relative steering, `phase1_check.py` preflight refuses to run. Phase 2 makes AutoHaul steer in relative mode, so manual driving never has to change.
 
 ### Needs your game (what I could not test)
 1. That 1.53.2.1 loads the bridge and polls its input device: telemetry, steering, lights, blinkers and pedals in the real game.

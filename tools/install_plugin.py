@@ -12,6 +12,7 @@ The game must be closed: Windows locks loaded DLLs.
 from __future__ import annotations
 
 import argparse
+import filecmp
 import shutil
 import subprocess
 import sys
@@ -48,7 +49,8 @@ def main() -> int:
                 print(f"  {group:7s} {n:22s} {'installed' if (plugins / n).exists() else '-'}")
         return 0
 
-    if game_running():
+    running = game_running()
+    if running and args.remove:
         print("ETS2 is running: close the game first (loaded DLLs are locked).")
         return 1
 
@@ -67,12 +69,23 @@ def main() -> int:
     for g in groups:
         for n in FILES[g]:
             src = out / n
+            dst = plugins / n
             if not src.exists():
                 print(f"{src} not built: run `python tools/build_native.py`")
                 return 1
-            shutil.copy2(src, plugins / n)
-            print(f"installed {plugins / n}")
-    print("Done. Start ETS2. If it warns that SDK plugins / advanced SDK features are in use, confirm with OK.")
+            if dst.exists() and filecmp.cmp(src, dst, shallow=False):
+                print(f"already installed {dst}")
+                continue
+            if running and dst.exists():
+                # The game has this DLL loaded (locked); a new file it hasn't loaded yet is safe to add.
+                print(f"ETS2 is running and {n} is loaded: close the game first to replace it.")
+                return 1
+            shutil.copy2(src, dst)
+            print(f"installed {dst}")
+    if running:
+        print("Done. ETS2 is running: plugins load at startup, so restart the game to activate new ones.")
+    else:
+        print("Done. Start ETS2. If it warns that SDK plugins / advanced SDK features are in use, confirm with OK.")
     return 0
 
 
