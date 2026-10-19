@@ -32,7 +32,10 @@ Target: ETS2 **1.53.2.1**, single-player. Status 2026-10-19: built and tested wi
 | Override: telemetry cross-check (keyboard hook off) | Foreign steering detected ~70 ms after it started |
 | Not yet working | The `engine` button doesn't stop the engine (pulse or hold). To investigate in Phase 2 |
 | ETS2LA plugin, unmodified pin | **Crashed the game** on Drive (twice): access violation in `get_traffic_objects_data`, the traffic-light/gate reader |
-| ETS2LA plugin + patch 0002 (traffic-light reader off, other readers SEH-guarded) | Loads and runs. **Camera** PASS (283/283 plausible). **AI traffic** PASS: 20 vehicles at once, sizes realistic, reported speeds match measured movement exactly. **Traffic lights**: off (needs vision in Phase 3). **Route**: pending a drive with an active GPS route |
+| ETS2LA plugin + patch 0002 (traffic-light reader off, other readers SEH-guarded) | Loads and runs. **Camera** PASS (283/283 plausible). **AI traffic** PASS: 20 vehicles at once, sizes realistic, reported speeds match measured movement exactly. **Traffic lights**: off (needs vision in Phase 3). **Route**: FAIL, stays empty while the game's GPS has a route (0.98 km); no crash, no FPS cost. Phase 3 uses AutoHaul's own routing over the extracted map, cross-checked with telemetry `navigation.distance` |
+| Xbox controller (`tools/pad_check.py`) | Stick left/right and both triggers detected as manual override. BACK (`0x20`) + START (`0x10`) report the kill-chord bits (`0x30`) |
+
+**Phase 1 status: complete (2026-10-19).** Every Phase 1 deliverable works on 1.53.2.1. The two ETS2LA readers that don't work (traffic lights, route) have planned fallbacks.
 
 **Steering mode:** the Phase 1 control checks ran with absolute steering (`c_relatsteer 0`). For your manual keyboard driving, the profile is back on relative steering (`c_relatsteer 1`; backups in `%USERPROFILE%\AutoHaul\backups\`). With relative steering, `phase1_check.py` preflight refuses to run. Phase 2 makes AutoHaul steer in relative mode, so manual driving never has to change.
 

@@ -90,8 +90,9 @@ class SafetyMonitor:
                 return self._latch("kill", f"kill key {VK_NAME.get(k, hex(k))}")
         pads = xinput.poll() if self.use_xinput else []
         for p in pads:
-            if self.kill_chord and (p.buttons & self.kill_chord) == self.kill_chord:
-                return self._latch("kill", f"controller {p.index} kill chord")
+            reason = self.pad_kill(p)
+            if reason:
+                return self._latch("kill", reason)
         hdr = self.reader.header()
         if hdr.bridge_flags & L.BRIDGE_FLAG_KILL_LATCHED:
             return self._latch("kill", "kill key seen by the bridge DLL")
@@ -101,10 +102,9 @@ class SafetyMonitor:
             if k is not None:
                 return self._latch("override", f"driving key {VK_NAME.get(k, hex(k))}")
         for p in pads:
-            if abs(p.left_x) > self.stick_dz:
-                return self._latch("override", f"controller {p.index} steering stick ({p.left_x:+.2f})")
-            if p.left_trigger > self.trigger_th or p.right_trigger > self.trigger_th:
-                return self._latch("override", f"controller {p.index} pedal trigger")
+            reason = self.pad_override(p)
+            if reason:
+                return self._latch("override", reason)
         if frame is not None and cmd is not None and hdr.bridge_flags & L.BRIDGE_FLAG_CONTROL_ACTIVE:
             reason = self._crosscheck(frame, cmd)
             if reason:
@@ -123,6 +123,20 @@ class SafetyMonitor:
         if frame.paused:
             return Verdict(False, "game paused", "paused")
         return Verdict(True)
+
+    def pad_kill(self, p: xinput.PadState) -> str | None:
+        """Reason if this controller state is the kill chord (all chord buttons held)."""
+        if self.kill_chord and (p.buttons & self.kill_chord) == self.kill_chord:
+            return f"controller {p.index} kill chord"
+        return None
+
+    def pad_override(self, p: xinput.PadState) -> str | None:
+        """Reason if this controller state means the driver is taking over (stick or pedal trigger)."""
+        if abs(p.left_x) > self.stick_dz:
+            return f"controller {p.index} steering stick ({p.left_x:+.2f})"
+        if p.left_trigger > self.trigger_th or p.right_trigger > self.trigger_th:
+            return f"controller {p.index} pedal trigger"
+        return None
 
     def _crosscheck(self, frame: L.TelemetryFrame, cmd: Command) -> str | None:
         """Telemetry shows the game's combined input; if it differs from both our current and our

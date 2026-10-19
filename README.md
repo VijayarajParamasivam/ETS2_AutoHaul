@@ -3,7 +3,7 @@
 Autonomous job runner for **Euro Truck Simulator 2, single-player only** (target build 1.53.2.1). After you accept a job, AutoHaul drives to the trailer, couples it, drives to the destination and delivers. It plans fuel and rest stops, and weighs deadlines against fines and profit.
 
 - Design: [ARCHITECTURE.md](ARCHITECTURE.md)
-- Current phase: **Phase 1** (telemetry, control output, kill switch). Install and test steps: [docs/PHASE1.md](docs/PHASE1.md)
+- **Phase 1 complete** (telemetry, control output, kill switch, verified in-game on 1.53.2.1): [docs/PHASE1.md](docs/PHASE1.md). Next: Phase 2, highway lane keeping and speed control.
 
 ## Layout
 | Path | |

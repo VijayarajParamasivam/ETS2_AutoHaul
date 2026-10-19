@@ -215,7 +215,11 @@ def main() -> int:
                                 f"max {sem_max} at once, states seen {sorted(sem_states)}"
                                 + (f"; implausible: {sem_bad}" if sem_bad else "")
                                 + ("" if sem_max else "; none seen - drive towards a signalled junction and re-run")))
-            if route_max == 0:
+            if route_max == 0 and last_f is not None and last_f.navigation_distance > 0:
+                checks.append(Check("ets2la: route", "FAIL",
+                                    f"empty although the game's GPS has a route ({last_f.navigation_distance / 1000:.1f} km): "
+                                    "the reader can't locate the route on this build -> use AutoHaul's own routing"))
+            elif route_max == 0:
                 checks.append(Check("ets2la: route", "WARN", "empty - set a GPS destination or take a job and re-run"))
             else:
                 diffs = [abs(a - b) for a, b in route_vs_nav]

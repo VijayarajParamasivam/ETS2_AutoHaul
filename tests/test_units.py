@@ -283,6 +283,24 @@ def test_safety_user_pressing_throttle_is_override():
     assert m.check(frame(thr=0.6), Command(throttle=0.1)).kind == "override"
 
 
+def test_controller_kill_chord_and_override_with_real_button_values():
+    """Values as logged from the user's Xbox 360 pad on 2026-10-19: BACK 0x20, START 0x10, both 0x30."""
+    from autohaul.safety.xinput import PadState
+    m, _, _ = monitor()
+
+    def pad(buttons=0, lx=0.0, lt=0.0, rt=0.0):
+        return PadState(0, buttons, lx, 0.0, 0.0, 0.0, lt, rt)
+
+    assert m.pad_kill(pad(0x0030)) == "controller 0 kill chord"
+    assert m.pad_kill(pad(0x0020)) is None and m.pad_kill(pad(0x0010)) is None
+    assert m.pad_kill(pad(0x0004)) is None                       # D-pad left, as logged
+    assert "steering stick" in m.pad_override(pad(lx=-0.40))
+    assert "steering stick" in m.pad_override(pad(lx=+0.35))
+    assert "pedal trigger" in m.pad_override(pad(lt=1.0))
+    assert "pedal trigger" in m.pad_override(pad(rt=0.17))
+    assert m.pad_override(pad(lx=0.2, lt=0.1, rt=0.1)) is None   # inside dead zones
+
+
 def test_safety_bridge_kill_flag_and_transients():
     m, reader, _ = monitor()
     reader.age = 500

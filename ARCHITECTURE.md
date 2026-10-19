@@ -1,6 +1,6 @@
 # AutoHaul — Architecture (Step 0)
 
-Status: **approved** · 2026-10-19 (rev. 3: retargeted to game **1.53.2.1**; Phase 1 implemented, see [docs/PHASE1.md](docs/PHASE1.md))
+Status: **approved** · 2026-10-19 (rev. 3: retargeted to game **1.53.2.1**; Phase 1 complete, see [docs/PHASE1.md](docs/PHASE1.md))
 Scope: Euro Truck Simulator 2 **1.53.2.1**, **single-player only**, Windows. AutoHaul never supports TruckersMP or Convoy, and it refuses to engage if it detects either one (§5.11).
 
 ---
@@ -39,7 +39,7 @@ Current versions of several tools only support 1.59–1.61. Each one has a versi
 | SCS SDK headers | 1.15 | **1.15** (backward compatible; the game negotiates down) | Telemetry API 1.01 with ETS2 telemetry game version **1.18**, input API 1.00 | ✓ by design |
 | `mandatory.break` channel | patch 1.60+ | **not needed**: your 1.53 profile has only `g_fatigue` and no mandatory-break setting | fatigue = `rest.stop` only | n/a |
 | Input device (semantical) | — | own DLL against SDK input 1.00 | all needed mixes confirmed in your `controls.sii` (§2.4) | ✓ verified in your files |
-| **ETS2LA game-memory plugin** | `main` (patterns/structs for 1.61) | **`ETS2LA/plugin@c328dc38`** (2025-03-12), the last commit before "update data structures for 1.54" (2025-03-27) | 20 nearest traffic vehicles (pos, quat, size, speed, accel, up to 2 trailers), 20 nearest traffic lights/gates (state, time remaining, id), GPS route (≤5000 node UIDs with distance/time to end), camera (FOV, pos, quat) | ⚠ developed while 1.53 was current. **Tested 2026-10-19:** unmodified pin crashes the game (traffic-light reader, access violation). With patch 0002 (that reader off, others SEH-guarded): camera ✓, AI traffic ✓ (speeds match movement), route pending, traffic lights ✗ → vision |
+| **ETS2LA game-memory plugin** | `main` (patterns/structs for 1.61) | **`ETS2LA/plugin@c328dc38`** (2025-03-12), the last commit before "update data structures for 1.54" (2025-03-27) | 20 nearest traffic vehicles (pos, quat, size, speed, accel, up to 2 trailers), 20 nearest traffic lights/gates (state, time remaining, id), GPS route (≤5000 node UIDs with distance/time to end), camera (FOV, pos, quat) | ⚠ developed while 1.53 was current. **Tested 2026-10-19:** unmodified pin crashes the game (traffic-light reader, access violation). With patch 0002 (that reader off, others SEH-guarded): camera ✓, AI traffic ✓ (speeds match movement), route ✗ (stays empty) → own routing, traffic lights ✗ → vision |
 | Map extraction | TruckLib 0.5.x (format 907) | **TruckSim Maps parser `truckermudgeon/maps@eca70d70`** (2025-02-17). It includes "parser,generator: support 1.53 release" (`79f43437`, 2024-11-30) and is the last parser change before "support 1.55 release" (`b7481735`, 2025-07-10) | roads + road looks (lane lists, shoulders), prefab descriptions with **AI nav curves** (start/end poses, next/prev links, per-node input/output lanes), spawn points, trigger points, POIs (gas, service, parking, weigh station, garages, dealers), companies, ferries/trains, country truck speed limits | ✓ **verified 2026-10-19**: full parse of your files in 193 s (516,930 nodes, 204,887 roads, 60,556 prefabs / 61,468 nav curves, 18,848 POIs) |
 | Map cross-check (optional) | TruckLib 0.5.x | **TruckLib v0.1.7** (2025-05-21; map format **901** = game 1.51–1.54) | second, independent reader for `.mbd` and prefab `.ppd` | optional; needs .NET 8 SDK |
 
@@ -55,7 +55,7 @@ Current versions of several tools only support 1.59–1.61. Each one has a versi
 |---|---|
 | Traffic block | Vision vehicle detection (YOLO) + conservative ACC (larger gaps, lower speed cap) |
 | Semaphore block (**this happened**: reader crashes 1.53.2.1, disabled) | Vision traffic-light detector. Training crops come from projecting semaphore positions in the map data into the image, with the state labelled by colour. If confidence is low, hand control back at signalled junctions |
-| Route block | Our own A* over the extracted lane graph to the job destination, cross-checked against `truck.navigation.distance` every second |
+| Route block (**this happened**: empty on 1.53.2.1) | Our own A* over the extracted lane graph to the job destination, cross-checked against `truck.navigation.distance` every second |
 | Camera block | Camera pose from the truck pose + head offset + configured FOV (good enough for projecting labels) |
 | Whole plugin crashes on load | Remove it. AutoHaul runs at `DEGRADED` (highway-only, vision) until we port the struct offsets ourselves: diff `prism/` headers between `c328dc38` and the 1.54 commit, then fix them against your binary |
 | Map parser at `eca70d70` | TruckLib v0.1.7 exporter (C#), then our own exporter for `.mbd` + `.ppd` |
