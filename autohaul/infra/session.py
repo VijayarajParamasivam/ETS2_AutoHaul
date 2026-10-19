@@ -20,9 +20,18 @@ from autohaul.safety.supervisor import SafetyMonitor
 log = get_logger("session")
 
 
-def enable_ansi() -> None:
+def enable_ansi() -> bool:
     """Turn on VT escape processing in the Windows console (used by live displays)."""
-    os.system("")
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    handle = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+    mode = ctypes.c_uint32()
+    if handle and k32.GetConsoleMode(handle, ctypes.byref(mode)):
+        # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(k32.SetConsoleMode(handle, mode.value | 0x0001 | 0x0004))
+    os.system("")  # not a console (e.g. redirected): best effort
+    return False
 
 
 class Session:

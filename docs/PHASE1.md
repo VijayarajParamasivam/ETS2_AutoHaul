@@ -29,10 +29,10 @@ Target: ETS2 **1.53.2.1**, single-player. Status 2026-10-19: built and tested wi
 ## Before you start
 - **Save your game manually** (and before step 3 especially). If the memory plugin's offsets don't match 1.53.2.1, it can crash the game.
 - Every command below runs in **PowerShell from the project folder** (the folder you cloned AutoHaul into), using the project's Python environment `.venv`.
+- **Required:** Options → Gameplay → Transmission type → **Automatic**, not "Simple automatic". In Simple automatic (telemetry shows `shifter arcade`), holding the brake at a standstill shifts into reverse. AutoHaul holds the brake at every stop, so `phase1_check.py` refuses to run in that mode.
 - Recommended game settings (Options):
   - Controls → steering: non-linearity **0**, speed-sensitive steering **off**.
-  - Gameplay → transmission: **automatic**.
-  - Display: **borderless window**. Not needed in Phase 1, but the overlay needs it later.
+  - Display: **borderless window**. Switching between the console and the game is much easier, and the overlay needs it later.
 - Kill keys: **`\` (backslash)** or **Pause/Break** (Pause also pauses the game), or **BACK+START** on the Xbox controller.
 
 ## Step 1: install the bridge only
@@ -51,7 +51,8 @@ Then watch live telemetry (read-only, sends nothing):
 ```
 
 **Expected:**
-- About 60 Hz, `bridge flags: TEL INPUT`, `telemetry game v1.18`.
+- About 60 Hz, `bridge flags: TEL INPUT`, `telemetry game v1.18`, `shifter automatic`.
+- `safety now: OK`. If you press a driving key (arrows, W/A/S/D, Space), it shows `(last trip ... override: driving key ...)`. That's expected: the dashboard only reports, it never drives.
 - Speed, gear, fuel, `rest needed in`, job and trailer all match the game.
 - `mandatory break n/a (1.53)`.
 - The ETS2LA line shows `-` (not installed yet).

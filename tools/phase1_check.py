@@ -106,6 +106,13 @@ def preflight(s: Session, r: Result) -> bool:
         r.fail(f"truck is moving ({f.speed * 3.6:.1f} km/h): stop and engage the parking brake")
     if not f.parking_brake:
         r.fail("parking brake is off: engage it (Space by default)")
+    cfg = s.reader.read_config()
+    shifter = text(cfg.controls.shifter_type) if cfg and cfg.controls.present else ""
+    if shifter == "arcade":
+        r.fail("transmission is 'Simple automatic' (arcade): holding the brake at a standstill shifts into "
+               "reverse. Set Options -> Gameplay -> Transmission type -> Automatic")
+    elif shifter in ("manual", "hshifter"):
+        r.warn(f"transmission is '{shifter}': Phase 1 checks work, but AutoHaul drives with Automatic")
     mp = multiplayer_reasons(f, hdr.game_pid, s.cfg.get("safety.mp_guard_modules"))
     if mp:
         r.fail("multiplayer detected: " + "; ".join(mp))

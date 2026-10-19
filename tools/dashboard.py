@@ -9,6 +9,7 @@ Ctrl+C to quit. The dashboard never controls the truck.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -37,7 +38,7 @@ def game_clock(t: int) -> str:
 
 
 def render(s: Session, f: L.TelemetryFrame, intervals: Rolling, ages: Rolling, events: list[str],
-           gd: GameDataReader, gd_counts: dict) -> str:
+           gd: GameDataReader, gd_counts: dict, safety_line: str) -> str:
     hdr = s.reader.header()
     cfg = s.reader.read_config()
     flags = " ".join(n for n, bit in FLAGS if hdr.bridge_flags & bit) or "-"
@@ -83,8 +84,7 @@ def render(s: Session, f: L.TelemetryFrame, intervals: Rolling, ages: Rolling, e
                      f"retarder steps {cfg.truck.retarder_step_count}  shifter {text(cfg.controls.shifter_type)}")
     lines.append("")
     lines.append("ETS2LA memory plugin: " + "  ".join(f"{k} {v}" for k, v in gd_counts.items()))
-    verdict = s.safety.check(f, None)
-    lines.append(f"safety: {'OK' if verdict.ok else verdict.kind.upper() + ' - ' + (verdict.reason or '')}")
+    lines.append(safety_line)
     lines.append("")
     lines.append("recent gameplay events:")
     if events:
@@ -109,7 +109,10 @@ def main() -> int:
         events: list[str] = []
         next_draw = 0.0
         gd_counts: dict = {}
-        print("\x1b[2J", end="")
+        last_trip = ""
+        screen = ""
+        # Alternate screen buffer: redraw in place without scrolling; the shell's screen returns on exit.
+        print("\x1b[?1049h\x1b[?25l\x1b[2J", end="", flush=True)
         try:
             while True:
                 f = s.reader.wait_frame(200)
@@ -130,10 +133,25 @@ def main() -> int:
                     t, sem, r = gd.traffic(), gd.semaphores(), gd.route()
                     gd_counts = {"traffic": "-" if t is None else len(t), "lights": "-" if sem is None else len(sem),
                                  "route": "-" if r is None else len(r), "camera": "-" if gd.camera() is None else "ok"}
-                    print("\x1b[H\x1b[J" + render(s, f, intervals, ages, events, gd, gd_counts), flush=True)
+                    # The dashboard never drives, so a kill / override is only reported, then re-armed.
+                    verdict = s.safety.check(f, None)
+                    if not verdict.ok and verdict.latched and verdict.kind in ("kill", "override"):
+                        last_trip = f"{time.strftime('%H:%M:%S')} {verdict.kind}: {verdict.reason}"
+                        s.safety.reset()
+                        verdict = s.safety.check(f, None)
+                    now_text = "OK" if verdict.ok else f"{verdict.kind.upper()} - {verdict.reason}"
+                    safety_line = f"safety now: {now_text}" + (f"   (last trip {last_trip})" if last_trip else "")
+                    screen = render(s, f, intervals, ages, events, gd, gd_counts, safety_line)
+                    size = shutil.get_terminal_size((120, 40))
+                    width, height = max(40, size.columns - 1), max(10, size.lines - 1)
+                    rows = [line[:width] + "\x1b[K" for line in screen.splitlines()[:height]]
+                    print("\x1b[H" + "\n".join(rows) + "\x1b[J", end="", flush=True)
         except KeyboardInterrupt:
             pass
         finally:
+            print("\x1b[?25h\x1b[?1049l", end="", flush=True)
+            if screen:
+                print(screen)  # the last snapshot stays in the normal scrollback, easy to copy
             gd.close()
     if s.recording_path:
         print(f"recording: {s.recording_path}")
