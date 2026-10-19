@@ -301,6 +301,41 @@ def test_controller_kill_chord_and_override_with_real_button_values():
     assert m.pad_override(pad(lx=0.2, lt=0.1, rt=0.1)) is None   # inside dead zones
 
 
+def test_safety_axes_speed_only_lets_the_driver_steer():
+    m, _, kb = monitor()
+    m.set_axes(steering=False, pedals=True)
+    m.reset()
+    kb.state.on_event(vk("A"), True)
+    for _ in range(5):                                   # steering key + telemetry steering: fine
+        assert m.check(frame(steer_in=0.6, thr=0.3), Command(throttle=0.3)).ok
+    kb.state.on_event(vk("S"), True)
+    assert m.check(frame(), Command()).kind == "override"
+
+
+def test_safety_axes_steering_only_lets_the_driver_use_pedals():
+    from autohaul.safety.xinput import PadState
+    m, _, kb = monitor()
+    m.set_axes(steering=True, pedals=False)
+    m.reset()
+    kb.state.on_event(vk("W"), True)
+    for _ in range(5):
+        assert m.check(frame(steer_in=-0.1, thr=1.0), Command(steer=0.1)).ok
+    assert m.pad_override(PadState(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0)) is None
+    assert "steering stick" in m.pad_override(PadState(0, 0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0))
+    kb.state.on_event(vk("LEFT"), True)
+    assert m.check(frame(), Command()).kind == "override"
+
+
+def test_safety_relative_mode_skips_the_steering_value_check():
+    reader, kb = FakeReader(), FakeKeyboard()
+    m = SafetyMonitor(load_config(local=None), reader, kb, use_xinput=False, steering_mode="relative")
+    for _ in range(5):              # relative mode: telemetry shows -1 while AutoHaul turns the wheel at 0.3
+        assert m.check(frame(steer_in=-1.0), Command(steer=0.3)).ok
+    for _ in range(3):
+        v = m.check(frame(steer_in=-1.0, brk=0.8), Command(steer=0.3))
+    assert v.kind == "override" and "brake" in v.reason
+
+
 def test_safety_bridge_kill_flag_and_transients():
     m, reader, _ = monitor()
     reader.age = 500

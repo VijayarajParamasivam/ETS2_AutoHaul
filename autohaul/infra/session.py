@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from autohaul.infra.config import Config, load_config
+from autohaul.infra.gameenv import steering_mode
 from autohaul.infra.log import get_logger, setup_logging
 from autohaul.infra.paths import logs_dir, recordings_dir
 from autohaul.io import _layout as L
@@ -48,7 +49,7 @@ class Session:
             if not self.keyboard.start():
                 log.warning(f"keyboard hook unavailable: {self.keyboard.error}")
                 self.keyboard = None
-        self.safety = SafetyMonitor(self.cfg, self.reader, self.keyboard)
+        self.safety = SafetyMonitor(self.cfg, self.reader, self.keyboard, steering_mode=steering_mode(self.cfg))
         self.controls: Controls | None = None
         self._want_controls = controls
         self.recorder: Recorder | None = None

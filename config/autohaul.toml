@@ -28,7 +28,9 @@ kill_xinput_chord = ["BACK", "START"]
 # Manual override: any of these hands control back immediately.
 override_stick_deadzone = 0.25          # left stick deflection, 0..1
 override_trigger_threshold = 0.15       # triggers, 0..1
-override_keys = ["W", "A", "S", "D", "UP", "DOWN", "LEFT", "RIGHT", "SPACE"]
+# In speed-only mode only the pedal keys count (you steer), in steering-only mode only the steering keys.
+override_steering_keys = ["A", "D", "LEFT", "RIGHT"]
+override_pedal_keys = ["W", "S", "UP", "DOWN", "SPACE"]
 # Telemetry cross-check: |truck.input.* - commanded| above these means someone else is steering/driving.
 override_steering_tolerance = 0.12
 override_pedal_tolerance = 0.15
@@ -42,6 +44,23 @@ telemetry_stale_ms = 50
 telemetry_stale_abort_ms = 1000
 # Refuse to engage when any multiplayer indicator is present.
 mp_guard_modules = ["core_ets2mp.dll"]
+
+[drive]
+# tools/drive.py (Phase 2: lane keeping + speed / following distance).
+engage_key = "SLASH"              # "/" toggles AutoHaul on and off; unbound in your controls.sii
+beeps = true                      # high beeps = engaged, low = handed back, rapid = fault
+status_hz = 5
+require_traffic_data = true       # refuse speed control without the ETS2LA traffic reader (no lead vehicles)
+steer_deg_per_unit = 38.0         # single-track wheel angle per unit of effective steering (measured)
+relative_deadzone = 0.0           # game-side steering-axis deadzone; measure with tools/steer_ident.py
+front_overhang_m = 1.45           # front axle to bumper (following distance is measured from the bumper)
+# Speed planning (autohaul/control/speed.py SpeedParams; any field there can be set here)
+max_speed_kmh = 80.0
+limit_margin_kmh = 2.0            # drive this much under the posted limit
+unknown_limit_kmh = 60.0          # when the game reports no limit
+lat_acc_max = 1.4                 # m/s^2 in curves
+acc_time_gap_s = 2.2              # following distance = standstill gap + time gap x speed
+acc_standstill_m = 10.0
 
 [recorder]
 enabled = true

@@ -3,6 +3,9 @@
 Checks, in priority order:
   kill       kill key (keyboard hook), Xbox BACK+START chord, or the DLL's own latched kill  -> latched
   override   driving keys, stick/trigger movement, or telemetry inputs that differ from ours  -> latched
+             (only for the axes AutoHaul controls: in speed-only mode the driver may steer, and the
+             reverse; in relative steering mode the steering value check is skipped, because the game
+             reports the wheel's turn direction there, and the autopilot's servo does that check)
   multiplayer Convoy / TruckersMP detected                                                    -> latched
   stale      no fresh telemetry frame                                                         -> transient
   paused     game paused                                                                      -> transient
@@ -39,14 +42,20 @@ class Verdict:
 
 
 class SafetyMonitor:
-    def __init__(self, cfg: Config, reader: TelemetryReader, keyboard: KeyboardMonitor | None, use_xinput: bool = True):
+    def __init__(self, cfg: Config, reader: TelemetryReader, keyboard: KeyboardMonitor | None, use_xinput: bool = True,
+                 steering_mode: str | None = None):
         s = cfg.section("safety")
         self.reader = reader
         self.keyboard = keyboard
         self.use_xinput = use_xinput
         self.kill_vks = vks(s["kill_keys"])
         self.kill_chord = xinput.chord_mask(s["kill_xinput_chord"])
-        self.override_vks = vks(s["override_keys"])
+        self.steer_vks = vks(s["override_steering_keys"])
+        self.pedal_vks = vks(s["override_pedal_keys"])
+        self.steering_mode = steering_mode
+        self.steering_axis = True
+        self.pedal_axes = True
+        self.override_vks = self.steer_vks + self.pedal_vks
         self.stick_dz = s["override_stick_deadzone"]
         self.trigger_th = s["override_trigger_threshold"]
         self.steer_tol = s["override_steering_tolerance"]
@@ -59,6 +68,11 @@ class SafetyMonitor:
         self._mp_reasons: list[str] = []
         self._prev_cmd = Command()
         self.reset()
+
+    def set_axes(self, steering: bool, pedals: bool) -> None:
+        """Which axes AutoHaul drives; only those count for manual override. Call reset() after."""
+        self.steering_axis, self.pedal_axes = steering, pedals
+        self.override_vks = (self.steer_vks if steering else ()) + (self.pedal_vks if pedals else ())
 
     def reset(self) -> None:
         """Re-engage: clear latched reasons and re-baseline key press counters."""
@@ -132,9 +146,9 @@ class SafetyMonitor:
 
     def pad_override(self, p: xinput.PadState) -> str | None:
         """Reason if this controller state means the driver is taking over (stick or pedal trigger)."""
-        if abs(p.left_x) > self.stick_dz:
+        if self.steering_axis and abs(p.left_x) > self.stick_dz:
             return f"controller {p.index} steering stick ({p.left_x:+.2f})"
-        if p.left_trigger > self.trigger_th or p.right_trigger > self.trigger_th:
+        if self.pedal_axes and (p.left_trigger > self.trigger_th or p.right_trigger > self.trigger_th):
             return f"controller {p.index} pedal trigger"
         return None
 
@@ -147,6 +161,10 @@ class SafetyMonitor:
                     frame.input_brake - c.brake)
         a, b = dev(cmd), dev(self._prev_cmd)
         ds, dt, db = min(a[0], b[0]), min(a[1], b[1]), min(a[2], b[2])
+        if not self.steering_axis or self.steering_mode == "relative":
+            ds = 0.0
+        if not self.pedal_axes:
+            dt = db = 0.0
         if ds > self.steer_tol or dt > self.pedal_tol or db > self.pedal_tol:
             self.mismatch_frames += 1
         else:

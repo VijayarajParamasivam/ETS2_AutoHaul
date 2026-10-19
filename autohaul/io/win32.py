@@ -124,3 +124,18 @@ class ReadOnlyMapping:
             kernel32.CloseHandle(self.handle)
         self.handle = None
         self.address = None
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+
+
+def foreground_pid() -> int:
+    """Process id owning the focused window (0 if none). The game reads input only while focused."""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return 0
+    pid = wt.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
