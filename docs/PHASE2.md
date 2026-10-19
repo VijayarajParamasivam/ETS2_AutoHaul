@@ -55,6 +55,12 @@ in-game driving is next.
     starting after the last delivered input.
   - The fake game can now fetch one event per frame, and an end-to-end test covers it.
   - The simulator models the same rule, and pulsed steering is off again.
+  - Refined: changed values always go before resyncs, and after the game reactivates the device (focus
+    change) only the 8 axes and pressed buttons are re-sent. Re-sending all 85 inputs had delayed AutoHaul's
+    first commands by ~1.3 s and could have delayed a kill-switch release. Fake-game tests cover both.
+  - Verified in-game, parked (`tools/pedal_check.py`, 2026-10-20): throttle/brake 0.30 reached the game in
+    every phase, with steering at 0, held, or changing every frame (before the fix: 0.00). The game took one
+    event per frame (863 calls in 863 frames); 6 changes it skipped were re-offered and delivered.
 - **Map: hidden roads are closed roads.** A teleport onto a test stretch landed on a road the game shows as
   closed (X markers). In the parsed map, `hidden` roads and junctions aren't drivable: 0 of 3,799 samples on
   roads you actually drove were hidden. The lane map now leaves them out (1.24M -> 802k lanes).

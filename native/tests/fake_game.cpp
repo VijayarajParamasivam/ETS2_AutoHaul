@@ -324,7 +324,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: fake_game <dll> [options]\n");
         return 2;
     }
-    int frames = 300, hz = 60, kill_at = -1, kill_frames = 10, pause_at = -1, resume_at = -1;
+    int frames = 300, hz = 60, kill_at = -1, kill_frames = 10, pause_at = -1, resume_at = -1, reactivate_at = -1;
     bool telemetry_only = false;  // load any telemetry-only plugin (e.g. ets2_la_plugin.dll)
     unsigned major = 1, minor = 18;
     g_drop.insert("mandatory.break");  // like 1.53 (telemetry game version 1.18)
@@ -344,6 +344,7 @@ int main(int argc, char** argv) {
         else if (a == "--telemetry-only") telemetry_only = true;
         else if (a == "--convoy") g_sim.convoy = true;
         else if (a == "--events-per-frame") g_events_per_frame = std::atoi(next());
+        else if (a == "--reactivate-at") reactivate_at = std::atoi(next());   // device off + on, like a focus change
     }
 
     HMODULE dll = LoadLibraryA(argv[1]);
@@ -406,6 +407,12 @@ int main(int argc, char** argv) {
         if (force_kill && kill_at > 0 && f == kill_at + kill_frames) force_kill(0);
         if (f == pause_at) fire(SCS_TELEMETRY_EVENT_paused, nullptr);
         if (f == resume_at) fire(SCS_TELEMETRY_EVENT_started, nullptr);
+        if (f == reactivate_at && g_device.input_active_callback) {
+            g_device.input_active_callback(0, g_device.callback_context);
+            g_device.input_active_callback(1, g_device.callback_context);
+            after_activation = true;
+            std::printf("REACTIVATED %d\n", f);
+        }
 
         scs_telemetry_frame_start_t fs{};
         fs.render_time = static_cast<scs_timestamp_t>(f) * 1000000ull / static_cast<unsigned>(hz);

@@ -468,6 +468,19 @@ void queue_button(uint32_t j, bool v) {
 
 void mark_delivered(const scs_input_event_t& e);
 
+// After (re)activation the game may have lost or reset the device's values. Re-send every axis and any
+// button that is or was pressed; released buttons need nothing (8 events instead of all 85).
+void force_resync(const InputState* target) {
+    for (uint32_t i = 0; i < NUM_AXES; ++i) {
+        g.force[i] = true;
+    }
+    for (uint32_t j = 0; j < NUM_BUTTONS; ++j) {
+        if (g.sent.buttons[j] || (target && target->buttons[j])) {
+            g.force[NUM_AXES + j] = true;
+        }
+    }
+}
+
 void prepare_input_frame(bool resend_all) {
     if (g.queue_pos < g.queue_len) {
         g.hdr->input_events_requeued += g.queue_len - g.queue_pos;   // offered last frame, never fetched
@@ -576,20 +589,27 @@ void prepare_input_frame(bool resend_all) {
     // take fewer events per frame than offered; events it doesn't fetch stay dirty and are offered again
     // next frame, starting after the last delivered input so steering, throttle and brake take turns.
     if (resend_all) {
-        for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
-            g.force[k] = true;
-        }
+        force_resync(&target);
     }
-    for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
-        const uint32_t i = (g.rr_start + k) % NUM_INPUTS;
-        if (i < NUM_AXES) {
-            if (g.force[i] || std::fabs(target.axes[i] - g.sent.axes[i]) > 1e-6f) {
-                queue_axis(i, target.axes[i]);
+    // Pass 1: inputs whose value changed (commands, releases after a kill) - always first, taking turns.
+    // Pass 2: forced resyncs of unchanged values. A game that fetches one event per frame then never makes
+    // a real change wait behind a resync.
+    for (int pass = 0; pass < 2; ++pass) {
+        for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
+            const uint32_t i = (g.rr_start + k) % NUM_INPUTS;
+            bool changed;
+            if (i < NUM_AXES) {
+                changed = std::fabs(target.axes[i] - g.sent.axes[i]) > 1e-6f;
+            } else {
+                changed = target.buttons[i - NUM_AXES] != g.sent.buttons[i - NUM_AXES];
             }
-        } else {
-            const uint32_t j = i - NUM_AXES;
-            if (g.force[i] || target.buttons[j] != g.sent.buttons[j]) {
-                queue_button(j, target.buttons[j]);
+            if (pass == 0 ? !changed : (changed || !g.force[i])) {
+                continue;
+            }
+            if (i < NUM_AXES) {
+                queue_axis(i, target.axes[i]);
+            } else {
+                queue_button(i - NUM_AXES, target.buttons[i - NUM_AXES]);
             }
         }
     }
@@ -630,9 +650,7 @@ SCSAPI_VOID on_input_active(const scs_u8_t active, const scs_context_t) {
         g.hdr->input_active = active ? 1 : 0;
     }
     if (!active) {
-        for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
-            g.force[k] = true;  // resend everything on reactivation
-        }
+        force_resync(nullptr);  // re-send axes and pressed buttons on reactivation
     }
 }
 
@@ -742,10 +760,8 @@ SCSAPI_RESULT scs_input_init(const scs_u32_t version, const scs_input_init_param
         logf(SCS_LOG_TYPE_error, "cannot register semantical input device");
         return SCS_RESULT_generic_error;
     }
-    for (uint32_t k = 0; k < NUM_INPUTS; ++k) {
-        g.force[k] = true;
-    }
     g.sent = InputState{};
+    force_resync(nullptr);
     g.client_known = false;
     g.was_alive = false;
     g.hdr->input_api_version = version;

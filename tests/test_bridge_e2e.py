@@ -172,6 +172,39 @@ def test_game_taking_one_event_per_frame_still_gets_every_input():
         assert game.values(name)[-1][1] == 0
 
 
+def _drive_steady(game: FakeGame, until_frame: int) -> None:
+    """Client holding steering 0.2, throttle 0.3 and the horn (nothing changes after the start)."""
+    game.wait_ready()
+    with Controls(game.suffix) as ctl:
+        ctl.set_enabled(True)
+        ctl.steer(0.2)
+        ctl.throttle(0.3)
+        ctl.hold("horn")
+        drv = Driver(ctl)
+        game.wait_frame(until_frame)
+        drv.stop()
+    game.wait_done()
+
+
+def test_reactivation_resends_only_axes_and_pressed_buttons():
+    """After the device is reactivated (e.g. focus change) the bridge re-sends what the game may have lost.
+    It used to re-send all 85 inputs, which at one event per frame delayed real commands by ~1.3 s."""
+    with FakeGame("--events-per-frame", "1", "--reactivate-at", "150", frames=300, hz=120) as game:
+        _drive_steady(game, 260)
+    burst = [(f, i) for f, i, _ in game.inputs if 150 <= f < 240]
+    assert len(burst) == L.NUM_AXES + 1, burst                       # 8 axes + the held horn
+    assert game.value_at("aforward", 239) == pytest.approx(0.3)
+
+
+def test_kill_release_is_not_delayed_by_a_reactivation_resync():
+    with FakeGame("--events-per-frame", "1", "--reactivate-at", "150", "--kill-at", "152", "--kill-frames", "30",
+                  frames=300, hz=120) as game:
+        _drive_steady(game, 260)
+    released = [f for f, v in game.values("aforward") if f >= 150 and v == 0]
+    assert released and released[0] <= 155, game.values("aforward")   # changed values go before the resync
+    assert game.value_at("steering", 156) == 0 and game.value_at("horn", 156) == 0
+
+
 def test_watchdog_releases_after_heartbeat_loss():
     with FakeGame(frames=480, hz=120) as game:
         reader = connect(game)
