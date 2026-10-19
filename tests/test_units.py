@@ -167,6 +167,30 @@ def test_gamedata_parsing_from_synthetic_blocks():
             m.close()
 
 
+def test_steering_mode_from_controls_sii(tmp_path, monkeypatch):
+    from autohaul.infra import gameenv
+    prof = tmp_path / "profiles" / "ABC"
+    prof.mkdir(parents=True)
+    sii = prof / "controls.sii"
+    sii.write_text('SiiNunit\n{\n config_lines[40]: "constant c_relatsteer 1.000000"\n}\n', encoding="utf-8")
+    cfg = load_config()
+    data = cfg.as_dict()
+    data["game"] = dict(data["game"], home_dir=str(tmp_path))
+    from autohaul.infra.config import Config
+    c2 = Config(data)
+    assert gameenv.steering_mode(c2) == "relative"
+    sii.write_text('"constant c_relatsteer 0.000000"', encoding="utf-8")
+    assert gameenv.steering_mode(c2) == "absolute"
+    sii.write_text('"constant c_other 1.0"', encoding="utf-8")
+    assert gameenv.steering_mode(c2) is None
+
+
+def test_elevation_check_on_own_process():
+    from autohaul.infra.gameenv import is_elevated
+    assert is_elevated(current_pid()) in (True, False)
+    assert is_elevated(0) is None
+
+
 def test_mp_guard_module_scan_on_own_process():
     mods = process_modules(current_pid())
     assert mods and any(m.startswith("python3") for m in mods)
@@ -208,7 +232,7 @@ def frame(steer_in=0.0, thr=0.0, brk=0.0, paused=0) -> L.TelemetryFrame:
 
 def monitor():
     reader, kb = FakeReader(), FakeKeyboard()
-    return SafetyMonitor(load_config(), reader, kb, use_xinput=False), reader, kb
+    return SafetyMonitor(load_config(local=None), reader, kb, use_xinput=False), reader, kb
 
 
 def test_safety_ok_when_inputs_match_command():

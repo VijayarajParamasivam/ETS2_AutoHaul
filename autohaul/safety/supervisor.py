@@ -139,5 +139,5 @@ class SafetyMonitor:
             self.mismatch_frames = 0
         if self.mismatch_frames >= self.mismatch_needed:
             which = "steering" if ds > self.steer_tol else ("throttle" if dt > self.pedal_tol else "brake")
-            return f"telemetry {which} differs from AutoHaul's command (Δsteer {ds:.2f}, Δthrottle {dt:.2f}, Δbrake {db:.2f})"
+            return f"telemetry {which} differs from AutoHaul's command (off by: steer {ds:.2f}, throttle {dt:.2f}, brake {db:.2f})"
         return None

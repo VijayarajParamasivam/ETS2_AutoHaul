@@ -39,6 +39,7 @@ class Recorder:
                   "created": time.time(), **(meta or {})}
         self.f.write(MAGIC)
         self.f.write(json.dumps(header).encode() + b"\n")
+        self.f.flush()  # a run that aborts early still leaves a readable file
         self.buf = bytearray()
         self.pending = 0
         self.flush_every = flush_every

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from autohaul.infra.gameenv import is_elevated, run_as_admin_flag, steering_mode  # noqa: E402
 from autohaul.infra.paths import cache_dir, logs_dir  # noqa: E402
 from autohaul.infra.session import Session  # noqa: E402
 from autohaul.io import _layout as L  # noqa: E402
@@ -113,6 +115,17 @@ def preflight(s: Session, r: Result) -> bool:
                "reverse. Set Options -> Gameplay -> Transmission type -> Automatic")
     elif shifter in ("manual", "hshifter"):
         r.warn(f"transmission is '{shifter}': Phase 1 checks work, but AutoHaul drives with Automatic")
+    mode = steering_mode(s.cfg)
+    if mode == "relative":
+        r.fail("steering is in RELATIVE mode (controls.sii: c_relatsteer 1): the game turns the wheel at a speed "
+               "instead of holding AutoHaul's angle. Switch to absolute steering (docs/PHASE1.md)")
+    elif mode is None:
+        r.warn("could not read the steering mode from the profile's controls.sii")
+    if is_elevated(hdr.game_pid) and not is_elevated(os.getpid()):
+        flag = run_as_admin_flag(s.cfg)
+        r.warn("ETS2 runs as administrator" + (f" (RUNASADMIN flag in {flag})" if flag else "")
+               + " but AutoHaul doesn't: the kill key still works inside the game, but AutoHaul's keyboard hook and "
+               "the TruckersMP check can't see the game. Remove the flag (docs/PHASE1.md) or run AutoHaul as administrator")
     mp = multiplayer_reasons(f, hdr.game_pid, s.cfg.get("safety.mp_guard_modules"))
     if mp:
         r.fail("multiplayer detected: " + "; ".join(mp))
@@ -131,15 +144,34 @@ def countdown(msg: str) -> None:
     print(" " * 30, end="\r")
 
 
+def engage(s: Session, timeout_s: float = 2.0) -> None:
+    """Re-arm the bridge and wait until the DLL has actually cleared its kill latch.
+
+    The DLL only sees the re-arm on its next input frame; checking safety before that would trip on
+    the stale latch of an earlier kill."""
+    ctl = s.controls
+    assert ctl is not None
+    ctl.neutral()
+    ctl.set_enabled(False)
+    ctl.rearm()
+    end = time.monotonic() + timeout_s
+    while s.reader.header().bridge_flags & L.BRIDGE_FLAG_KILL_LATCHED:
+        if time.monotonic() > end:
+            raise Aborted(Verdict(False, "the bridge kept its kill latch: is a kill key still held, "
+                                         "or is the game window in the background?", "kill", True))
+        ctl.commit()
+        s.reader.wait_frame(50)
+    s.safety.reset()
+    ctl.set_enabled(True)
+
+
 def drive(s: Session, duration_s: float, fn: Callable[[float, L.TelemetryFrame], Command],
           actions: Callable[[float, L.TelemetryFrame], None] | None = None,
           until: Callable[[float, L.TelemetryFrame], bool] | None = None) -> list[tuple[float, L.TelemetryFrame, Command]]:
     """Run a control function every frame under the SafetyMonitor. Raises Aborted on any safety trip."""
     ctl = s.controls
     assert ctl is not None
-    ctl.rearm()
-    s.safety.reset()
-    ctl.set_enabled(True)
+    engage(s)
     trace = []
     guard = StaleGuard(s)
     t0 = time.monotonic()
@@ -223,9 +255,7 @@ def test_wiggle(s: Session, r: Result) -> None:
 
     ctl = s.controls
     assert ctl is not None
-    ctl.rearm()
-    s.safety.reset()
-    ctl.set_enabled(True)
+    engage(s)
     ctl.commit()
 
     def toggle(name: str, field_name: str, label: str) -> None:
@@ -266,15 +296,25 @@ def test_wiggle(s: Session, r: Result) -> None:
             r.warn("lights: could not restore the original light state - check them manually")
 
         f0 = latest(s)
-        ctl.press("wipers1" if not f0.wipers else "wipers0")
-        ctl.commit()
-        if wait_field(s, lambda f: f.wipers != f0.wipers):
-            r.info("wipers: direct position input works")
-            ctl.press("wipers0" if not f0.wipers else "wipers1")
-            ctl.commit()
-            wait_field(s, lambda f: f.wipers == f0.wipers)
+        # On 1.53.2.1 the direct positions wipers0..4 have no effect; the stalk works as 'wipers'
+        # (one stage up, stops at the top stage) and 'wipersback' (one stage down).
+        if f0.wipers:
+            r.info("wipers were already on: skipped")
         else:
-            r.fail("wipers: no change")
+            ctl.press("wipers")
+            ctl.commit()
+            if wait_field(s, lambda f: f.wipers == 1):
+                for _ in range(4):
+                    ctl.press("wipersback")
+                    ctl.commit()
+                    if wait_field(s, lambda f: f.wipers == 0, 1.0):
+                        break
+                if latest(s).wipers:
+                    r.warn("wipers: switched on but 'wipersback' did not switch them off - check them")
+                else:
+                    r.info("wipers: 'wipers' switches them on, 'wipersback' off")
+            else:
+                r.fail("wipers: no change after pressing 'wipers'")
 
         ctl.hold("horn")
         wait_field(s, lambda f: False, 0.4)
@@ -286,7 +326,9 @@ def test_wiggle(s: Session, r: Result) -> None:
             held = Command(brake=value) if axis == "abackward" else Command(throttle=value)
             ctl.axis(axis, value)
             ctl.commit()
-            ok = wait_field(s, lambda f, fn=field_name, v=value: abs(getattr(f, fn) - v) < 0.05, 1.0, held)
+            # 3 s: with the engine off, the first throttle press auto-starts it (g_engine_start_auto) and the
+            # game reports no throttle input until the engine runs.
+            ok = wait_field(s, lambda f, fn=field_name, v=value: abs(getattr(f, fn) - v) < 0.05, 3.0, held)
             ctl.axis(axis, 0.0)
             ctl.commit()
             wait_field(s, lambda f, fn=field_name: getattr(f, fn) < 0.05, 1.0, held)
@@ -454,9 +496,11 @@ def main() -> int:
                     results.append(r)
                     break
                 results.append(r)
-                print(f"{name}: {r.status}")
+                if s.recorder:
+                    s.recorder.flush()
+                print(f"{name}: {r.status}", flush=True)
                 for d in r.details:
-                    print(f"  - {d}")
+                    print(f"  - {d}", flush=True)
                 if name != names[-1]:
                     if not preflight(s, Result("recheck")):
                         print("stopping: the truck is no longer parked safely")

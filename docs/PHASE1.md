@@ -19,6 +19,19 @@ Target: ETS2 **1.53.2.1**, single-player. Status 2026-10-19: built and tested wi
 - **Bridge DLL: 28/28 automated tests pass.** The DLL runs inside `fake_game.exe`, which plays the game's side of the SDK. Covered: telemetry values, config, events, a missing `mandatory.break` (as on 1.53), axes/holds/pulses, watchdog release in 20–45 frames at 120 Hz (≈250 ms), kill latch until re-arm, release while paused, frame-rate/latency.
 - **Guided checks dry-run** against a simulated parked truck: wiggle, watchdog (released 278 ms after the last heartbeat) and calibrate all pass.
 
+### In-game results (2026-10-19, ETS2 1.53.2.1, Volvo FH4, absolute steering, not elevated)
+| Check | Result |
+|---|---|
+| Telemetry | 1.18, ~60 Hz, frame age 0.09 ms, no torn reads |
+| Input device | Polled ~56×/s while the game window is focused (0 in background) |
+| Steering | input = −command exactly; calibration linear, 1.0 = 38.6° front wheel |
+| Blinkers, hazards, headlights, wipers (`wipers`/`wipersback`), horn, throttle, brake | PASS |
+| Watchdog | Steering released 275 ms after the last heartbeat (250 ms setting) |
+| Kill key (`\`) | Steering input back to 0 **22 ms** after the press; the DLL latched it independently |
+| Override: driving key | Detected 0.7 ms after the press |
+| Override: telemetry cross-check (keyboard hook off) | Foreign steering detected ~70 ms after it started |
+| Not yet working | The `engine` button doesn't stop the engine (pulse or hold). To investigate in Phase 2 |
+
 ### Needs your game (what I could not test)
 1. That 1.53.2.1 loads the bridge and polls its input device: telemetry, steering, lights, blinkers and pedals in the real game.
 2. Kill key, watchdog and manual override against the real game.
@@ -30,6 +43,9 @@ Target: ETS2 **1.53.2.1**, single-player. Status 2026-10-19: built and tested wi
 - **Save your game manually** (and before step 3 especially). If the memory plugin's offsets don't match 1.53.2.1, it can crash the game.
 - Every command below runs in **PowerShell from the project folder** (the folder you cloned AutoHaul into), using the project's Python environment `.venv`.
 - **Required:** Options → Gameplay → Transmission type → **Automatic**, not "Simple automatic". In Simple automatic (telemetry shows `shifter arcade`), holding the brake at a standstill shifts into reverse. AutoHaul holds the brake at every stop, so `phase1_check.py` refuses to run in that mode.
+- **Required: absolute steering.** In your profile's `controls.sii`, `constant c_relatsteer` must be `0`. With `1` (relative steering), the game treats every steering input, AutoHaul's included, as a turn *rate*: a +0.3 command keeps turning the wheel instead of holding it. Measured on 1.53.2.1 it turns about 0.15 wheel-units per second, far too slow for junctions. With absolute steering your controller's stick position becomes the wheel position, so manual gamepad driving feels different.
+- **Required: don't run ETS2 as administrator.** `eurotrucks2.exe` has the "Run this program as an administrator" compatibility flag (`RUNASADMIN` in `HKCU\...\AppCompatFlags\Layers`). Windows then hides the game's keyboard input from AutoHaul, so its keyboard kill and override detection go blind while the game has focus. The in-game kill key still works. To fix: right-click `eurotrucks2.exe` → Properties → Compatibility → untick "Run this program as an administrator". Alternatively, run AutoHaul from an administrator PowerShell.
+- **The game window must have focus while AutoHaul drives:** ETS2 stops reading all input devices when it's in the background.
 - Recommended game settings (Options):
   - Controls → steering: non-linearity **0**, speed-sensitive steering **off**.
   - Display: **borderless window**. Switching between the console and the game is much easier, and the overlay needs it later.
@@ -181,6 +197,9 @@ $env:AUTOHAUL_SHM_SUFFIX = "_dry"; & "$env:USERPROFILE/AutoHaul/build/out/fake_g
 | Steering doesn't move but telemetry works | The input device isn't polled. Check `bridge flags` shows INPUT and `input frames` increases while driving. Tell me. |
 | "telemetry stale" aborts | The game froze for > 1 s (autosave / loading). Re-run. |
 | FPS drop with the ETS2LA plugin | A memory pattern failed on 1.53.2.1. Remove the plugin (`--remove ets2la`) and report. |
+| Wiggle: steering gain ≈ -2.5, or override "telemetry steering differs" | Relative steering is on (`c_relatsteer 1`). Switch to absolute (see Before you start). |
+| `input frames` stops increasing | The game window lost focus. ETS2 only reads input devices while it's in front. |
+| Wipers: `wipers0`–`wipers4` do nothing | That's 1.53 behaviour: only `wipers` (one stage up) and `wipersback` (one stage down) work. |
 
 ## Still missing after Phase 1
 - **No driving logic yet:** lane keeping, ACC, routing and mission logic start in Phase 2.
