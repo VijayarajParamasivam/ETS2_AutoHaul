@@ -37,9 +37,19 @@ class LaneTracker:
     def reset(self) -> None:
         self.state = None
 
-    def update(self, x: float, y: float, rotation: float, prefer: list[int] | None = None) -> LaneState | None:
+    def update(self, x: float, y: float, rotation: float, prefer: list[int] | None = None,
+               force: int | None = None, force_max_dist: float = 7.5) -> LaneState | None:
         """`prefer`: lanes of the path we are following (from path_ahead); at a split they win over the
         other branch while both are about equally close, so the tracker stays on the planned branch."""
+        if force is not None:
+            # a lane change: track the target lane even while the truck is still in the old one
+            for h in self.lm.nearest(x, y, rotation, max_dist=force_max_dist, k=8):
+                if h.lane == force:
+                    switched = self.state is not None and self.state.lane != h.lane
+                    # the lane is known (a deliberate change), so being between two lanes is not ambiguity;
+                    # the autopilot checks the truck against the eased line instead
+                    self.state = LaneState(h.lane, h.segment, h.t, h.lateral, h.heading_err, 0.9, switched)
+                    return self.state
         hits = self.lm.nearest(x, y, rotation, max_dist=self.max_lateral, k=6)
         if not hits:
             self.state = None

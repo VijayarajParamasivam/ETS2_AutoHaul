@@ -89,7 +89,8 @@ def test_graph_cache_roundtrip(junction, tmp_path):
 
 # ---------------------------------------------------------------- autopilot following a route (simulator)
 
-def _drive(lm, g, start_lane, target, seconds=60.0, junctions=None, speed_kmh=60.0):
+def _drive(lm, g, start_lane, target, seconds=60.0, junctions=None, speed_kmh=60.0, traffic=None,
+           **ap_kwargs):
     from autohaul.control.vehicle import TruckGeometry
     from autohaul.drive.autopilot import Autopilot
     from autohaul.sim.truck import TruckSim
@@ -98,12 +99,14 @@ def _drive(lm, g, start_lane, target, seconds=60.0, junctions=None, speed_kmh=60
     rot = math.atan2(pts[1, 1] - pts[0, 1], pts[1, 0] - pts[0, 0])
     x0, y0 = pts[0] + 20 * np.array([math.cos(rot), math.sin(rot)])
     sim = TruckSim(geom, x=x0, y=y0, rotation=rot, speed=speed_kmh / 3.6)
-    ap = Autopilot(lm, geom, "relative", router=Router(lm, g), junctions=junctions)
+    ap = Autopilot(lm, geom, "relative", router=Router(lm, g), junctions=junctions, **ap_kwargs)
     ap.set_destination(*target)
     assert ap.engage(sim.frame(80 / 3.6)) is None
     lanes, fault = [], None
     for _ in range(int(seconds / sim.p.dt)):
-        cmd, st = ap.step(sim.frame(80 / 3.6), [], sim.p.dt)
+        cmd, st = ap.step(sim.frame(80 / 3.6), [v.record() for v in (traffic or [])], sim.p.dt)
+        for v in traffic or []:
+            v.step(sim.t, sim.p.dt)
         if st.lane is not None and (not lanes or lanes[-1] != st.lane):
             lanes.append(st.lane)
         if st.fault:
@@ -120,10 +123,18 @@ def test_autopilot_follows_the_route_branch_and_arrives(junction):
     assert fault == "destination reached: take over"
 
 
-def test_autopilot_hands_back_for_a_needed_lane_change(junction):
+def test_autopilot_changes_lanes_for_the_exit(junction):
+    lm, g = junction
+    target = tuple(lm.lane_points(4)[-40])
+    lanes, fault, ap = _drive(lm, g, 0, target)
+    assert lanes[:4] == [0, 1, 3, 4]                    # signalled, moved right, took the exit
+    assert fault == "destination reached: take over"
+
+
+def test_autopilot_hands_back_for_a_lane_change_when_not_automated(junction):
     lm, g = junction
     target = tuple(lm.lane_points(4)[len(lm.lane_points(4)) // 2])
-    lanes, fault, ap = _drive(lm, g, 0, target)
+    lanes, fault, ap = _drive(lm, g, 0, target, auto_lane_change=False)
     assert fault and "lane change to the right" in fault
     assert lanes == [0]                                  # handed back on the approach, before the junction
 
@@ -154,3 +165,57 @@ def test_engage_refused_right_before_an_intersection():
     ap = Autopilot(lm, TruckGeometry(), "relative", junctions=Junctions(lm))
     assert "intersection in" in ap.engage(TruckSim(x=350, y=0, rotation=0.0, speed=10).frame())
     assert ap.engage(TruckSim(x=100, y=0, rotation=0.0, speed=10).frame()) is None
+
+
+# ---------------------------------------------------------------- lane changes
+
+def _veh(vid, x, y, speed, rot=0.0, length=4.5):
+    th = -(rot + math.pi / 2)
+    return {"wx": x, "wz": y, "qw": math.cos(th / 2), "qx": 0.0, "qy": math.sin(th / 2), "qz": 0.0,
+            "length": length, "width": 1.9, "speed": speed, "acceleration": 0.0, "id": vid,
+            "trailer_count": 0, "trailers": []}
+
+
+def test_gap_check_sides_and_distances():
+    from autohaul.control.lanechange import LaneChangeParams, gap_check
+    from autohaul.control.vehicle import Pose
+    p, pose = LaneChangeParams(), Pose(0.0, 0.0, 0.0, 20.0, 0.0)          # heading east, right = +y
+    check = lambda veh, side=1: gap_check(pose, side, [veh], 3.2, 3.5, p)   # noqa: E731
+    assert "alongside" in check(_veh(1, 0.0, 4.5, 20.0))
+    assert check(_veh(1, 0.0, -4.5, 20.0)) is None                          # that's the left lane
+    assert "alongside" in check(_veh(1, 0.0, -4.5, 20.0), side=-1)
+    assert check(_veh(1, 80.0, 4.5, 20.0)) is None                          # well ahead, same speed
+    assert "ahead" in check(_veh(1, 15.0, 4.5, 15.0))                       # close and slower
+    assert check(_veh(1, -60.0, 4.5, 20.0)) is None                         # behind, same speed
+    assert "behind" in check(_veh(1, -40.0, 4.5, 30.0))                     # behind and 10 m/s faster
+    assert check(_veh(1, 0.0, 12.0, 20.0)) is None                          # two lanes over
+
+
+def test_lane_change_waits_for_a_gap_then_hands_back_if_none(junction):
+    from autohaul.control.path import PathRef
+    from autohaul.sim.truck import SimVehicle
+    lm, g = junction
+    right = PathRef(lm.lane_points(1))
+    blocker = SimVehicle(1, right, s=20.0, speed=60 / 3.6, length=16.0, width=2.5)   # alongside, same speed
+    lanes, fault, ap = _drive(lm, g, 0, tuple(lm.lane_points(4)[-40]), traffic=[blocker])
+    assert fault and fault.startswith("no room left to change lanes to the right")
+    assert lanes == [0]
+
+
+def test_lane_change_after_the_neighbour_drops_back(junction):
+    from autohaul.control.path import PathRef
+    from autohaul.sim.truck import SimVehicle
+    lm, g = junction
+    right = PathRef(lm.lane_points(1))
+    slower = SimVehicle(1, right, s=24.0, speed=45 / 3.6, length=16.0, width=2.5)    # alongside, slower
+    lanes, fault, ap = _drive(lm, g, 0, tuple(lm.lane_points(4)[-40]), traffic=[slower])
+    assert lanes[:4] == [0, 1, 3, 4] and fault == "destination reached: take over"
+
+
+def test_slow_lane_change_completes(junction):
+    """Regression (2026-10-20 in-game): pulling away from a standstill, the move took long enough that the
+    'between two lanes' moment lowered the tracker confidence for > 1 s and AutoHaul handed back."""
+    lm, g = junction
+    lanes, fault, ap = _drive(lm, g, 0, tuple(lm.lane_points(4)[-40]), speed_kmh=20.0, seconds=200.0,
+                              speed_params=__import__("autohaul.control.speed", fromlist=["SpeedParams"]).SpeedParams(max_speed_kmh=25))
+    assert lanes[:4] == [0, 1, 3, 4] and fault == "destination reached: take over"

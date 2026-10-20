@@ -10,11 +10,13 @@ It never decides alone that driving is safe: tools/drive.py runs SafetyMonitor a
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from autohaul.control.lanechange import LaneChange, LaneChangeParams, gap_check, offset_profile
 from autohaul.control.path import PathRef
 from autohaul.control.speed import KMH, Lead, PedalController, SpeedParams, SpeedPlanner, acc_accel, find_lead
 from autohaul.control.steering import AbsoluteServo, LateralController, LateralParams, PulseModulator, RelativeServo
@@ -83,6 +85,8 @@ class Status:
     route_km: float | None = None     # remaining driving distance on the route (world km; the GPS shows ~x19)
     on_route: bool = False
     route_note: str = ""
+    indicator: str | None = None      # "left" / "right" while AutoHaul signals a lane change
+    lane_change: str = ""
     timings_ms: dict = field(default_factory=dict)
 
 
@@ -92,7 +96,8 @@ class Autopilot:
                  lat_params: LateralParams | None = None, speed_params: SpeedParams | None = None,
                  relative_gain: float = 0.42, relative_deadzone: float = 0.0, hazards: np.ndarray | None = None,
                  pulse_steering: bool = False, check_pedals: bool = True,
-                 router: Router | None = None, junctions: Junctions | None = None):
+                 router: Router | None = None, junctions: Junctions | None = None,
+                 lane_change: LaneChangeParams | None = None, auto_lane_change: bool = True):
         """`hazards`: (n, 2) map points AutoHaul must not drive through itself, e.g. toll plazas.
         `pulse_steering`: relative steering as single-frame pulses (PulseModulator); off by default (the pedal
         loss it was meant to fix was the game taking one input event per frame, fixed in the bridge DLL).
@@ -129,6 +134,11 @@ class Autopilot:
         self.route: Route | None = None
         self._last_reroute = -1e9
         self._sim_clock = 0.0
+        self.lcp = lane_change or LaneChangeParams()
+        self.auto_lane_change = auto_lane_change
+        self.lc: LaneChange | None = None
+        self._odo = 0.0
+        self._trailer = False
 
     def set_destination(self, x: float, y: float) -> None:
         self.destination = (x, y)
@@ -156,6 +166,7 @@ class Autopilot:
     def engage(self, frame) -> str | None:
         """Reset the controllers on the current state. Returns why engaging is refused, or None."""
         self.tracker.reset()
+        self.lc = None
         self.lat.reset()
         self.servo.reset()
         if self.pulse:
@@ -233,12 +244,83 @@ class Autopilot:
                 cur, nxt = int(lm.lane_sub[rt.lanes[j]]), int(lm.lane_sub[rt.lanes[j + 1]])
                 side = "right" if abs(nxt) > abs(cur) else "left"
                 out.route_note = f"lane change {side} needed within {dist:.0f} m"
-                if dist <= horizon:
+                if dist <= horizon and self.lateral_on and not self.auto_lane_change:
                     return f"the route needs a lane change to the {side} (within {dist:.0f} m): take over"
                 break
             if dist > horizon:
                 break
             dist += float(self.router.g.length[rt.lanes[j + 1]])
+        return None
+
+    def _upcoming_change(self, st, lookahead_m: float = 3000.0) -> tuple[int, float] | None:
+        """The route's next lane change: (side +1 right / -1 left, metres until it must be done)."""
+        rt = self.route
+        i = rt.lane_index.get(st.lane)
+        if i is None:
+            return None
+        dist = float(self.router.g.length[st.lane]) - self._progress_m(st)
+        for j in range(i, len(rt.lanes) - 1):
+            if rt.changes[j + 1]:
+                cur, nxt = int(self.lm.lane_sub[rt.lanes[j]]), int(self.lm.lane_sub[rt.lanes[j + 1]])
+                return (1 if abs(nxt) > abs(cur) else -1), dist
+            if dist > lookahead_m:
+                return None
+            dist += float(self.router.g.length[rt.lanes[j + 1]])
+        return None
+
+    def _neighbour(self, lane: int, side: int) -> int | None:
+        """The parallel lane of the same road on `side` (+1 right: larger |sub|), if there is one."""
+        sub = abs(int(self.lm.lane_sub[lane]))
+        for n in self.router.g.neighbours(lane).tolist():
+            if (abs(int(self.lm.lane_sub[n])) > sub) == (side > 0):
+                return int(n)
+        return None
+
+    def _lane_change_step(self, st, pose, traffic, out: Status) -> str | None:
+        """Signal, wait for a gap, then move into the lane the route needs (only when AutoHaul steers).
+        The change is made as early as possible: into the neighbouring lane of whatever road piece the truck is
+        on, then the route is re-planned from there (the planner itself puts changes at the last moment)."""
+        lc, p = self.lc, self.lcp
+        if lc is None or lc.phase == "signal":
+            if not (self.lateral_on and self.auto_lane_change and self.route and self.router):
+                return None
+            up = self._upcoming_change(st)
+            if up is None:
+                self.lc = None
+                return None
+            side, deadline = up
+            target = self._neighbour(st.lane, side)
+            if lc is None:
+                if target is None:
+                    return None                 # no lane on that side here yet: wait for one
+                lc = self.lc = LaneChange(target, side, self._sim_clock)
+            elif target is not None:
+                lc.target = target              # the truck moved onto the next road piece while signalling
+        out.indicator = lc.side_name
+        v = max(pose.speed, 0.0)
+        rear = p.trailer_rear_m if self._trailer else p.tractor_rear_m
+        if lc.phase == "signal":
+            length = max(p.min_len_m, p.len_s * v)
+            why = gap_check(pose, lc.side, traffic, self.geom.front_bumper, rear, p)
+            signalled = self._sim_clock - lc.started >= p.signal_s
+            lc.waiting = why or ("" if signalled else "signalling")
+            if deadline < length + p.deadline_margin_m:
+                return f"no room left to change lanes to the {lc.side_name} ({why or 'too close to the split'}): take over"
+            if not why and signalled and self._neighbour(st.lane, lc.side) is not None:
+                hit = [h for h in self.lm.nearest(pose.x, pose.y, pose.rotation, max_dist=8.0, k=8) if h.lane == lc.target]
+                if not hit:
+                    return "can't find the target lane for the lane change: take over"
+                lc.phase, lc.d0, lc.length = "move", self._odo, length
+                lc.profile = offset_profile(hit[0].lateral, length)
+            out.lane_change = f"{lc.side_name}: {lc.waiting or 'moving'} (needed within {deadline:.0f} m)"
+            return None
+        d = self._odo - lc.d0
+        if d >= lc.length:
+            self.lc = None
+            out.indicator, out.lane_change = None, "done"
+            self._last_reroute = -1e9               # re-plan from the new lane right away
+            return None
+        out.lane_change = f"{lc.side_name}: moving {d / lc.length * 100:.0f}%"
         return None
 
     def hazard_ahead(self, path: PathRef, s0: float, speed: float) -> str | None:
@@ -267,12 +349,16 @@ class Autopilot:
         cmd = Command()
         pose = pose_from_frame(frame)
         self._sim_clock += dt
+        self._odo += max(frame.speed, 0.0) * dt
+        trailers = getattr(frame, "trailers", None)
+        self._trailer = bool(trailers is not None and trailers[0].connected)
         prefer = self.tracker.path_lanes
         if self.route and self.tracker.state is not None:
             i = self.route.lane_index.get(self.tracker.state.lane)
             if i is not None:
                 prefer = self.route.lanes[i:i + 12]
-        st = self.tracker.update(pose.x, pose.y, pose.rotation, prefer=prefer)
+        moving = self.lc is not None and self.lc.phase == "move"
+        st = self.tracker.update(pose.x, pose.y, pose.rotation, prefer=prefer, force=self.lc.target if moving else None)
         t1 = clock()
         if st is None:
             self._lost += dt
@@ -286,6 +372,10 @@ class Autopilot:
         self._lost = 0.0
         out.lane, out.lane_desc, out.confidence = st.lane, self.lm.describe(st.lane), st.confidence
         out.lateral, out.heading_err_deg = st.lateral, math.degrees(st.heading_err)
+        # during a lane change the tracker follows the target lane; measure against the eased line instead
+        moving_now = self.lc is not None and self.lc.phase == "move" and self.lc.profile is not None
+        off_ref = st.lateral - (self.lc.profile(self._odo - self.lc.d0)[0] if moving_now else 0.0)
+        out.lateral = off_ref                       # offset from the line being followed
         self._low_conf = self._low_conf + dt if st.confidence < self.p.min_confidence else 0.0
         if self.destination is not None and self.router is not None:
             if (self.route is None or st.lane not in self.route.lane_index) and                     self._sim_clock - self._last_reroute >= self.p.reroute_interval_s:
@@ -307,12 +397,20 @@ class Autopilot:
             out.fault = self._junction_ahead(path, s_truck, max(frame.speed, 0.0))
         if self.route is not None and out.on_route and not out.fault:
             out.fault = self._route_checks(st, max(frame.speed, 0.0), out)
+        if not out.fault and (self.lc is not None or self.route is not None):
+            out.fault = self._lane_change_step(st, pose, traffic, out)
+        if out.fault and self.lc is not None:
+            self.lc = None                          # handing back: AutoHaul stops signalling
         t2 = clock()
 
         # --- lateral
         rate = (self.servo.gain * self.servo.max_cmd * self.geom.rad_per_unit
                 if isinstance(self.servo, RelativeServo) else None)    # fastest the wheel turns, rad/s
-        lat = self.lat.step(pose, path, dt, measured_steer_left(frame, self.geom), steer_rate=rate)
+        offset = None
+        if self.lc is not None and self.lc.phase == "move":
+            lc, odo = self.lc, self._odo
+            offset = lambda ds: lc.profile(odo - lc.d0 + ds)          # noqa: E731
+        lat = self.lat.step(pose, path, dt, measured_steer_left(frame, self.geom), steer_rate=rate, offset=offset)
         out.ctrl_lateral, out.kappa_ff, out.curve_ratio = lat.lateral, lat.kappa_ff, lat.ratio
         target = max(-self.p.max_steer_units, min(self.p.max_steer_units, lat.steer_left / self.geom.rad_per_unit))
         out.steer_target = target
@@ -324,8 +422,8 @@ class Autopilot:
             out.servo_gain = getattr(self.servo, "gain", 0.0)
             if out.fault:
                 pass
-            elif abs(st.lateral) > self.p.max_lateral_m:
-                out.fault = f"{abs(st.lateral):.1f} m off the lane centre"
+            elif abs(off_ref) > self.p.max_lateral_m:
+                out.fault = f"{abs(off_ref):.1f} m off the {'lane-change line' if moving_now else 'lane centre'}"
             elif self._low_conf > self.p.low_confidence_s:
                 out.fault = f"lane match uncertain for {self._low_conf:.1f} s"
             elif self.servo.fighting:
@@ -367,7 +465,10 @@ class Autopilot:
             if a_need < -0.15:
                 a_req = min(a_req, 1.1 * a_need)
             emergency = False
-            lead = find_lead(path, s0 + self.geom.front_bumper, traffic, self.sp)
+            sp_lead = self.sp
+            if self.lc is not None and self.lc.phase == "move":       # straddling: watch both lanes
+                sp_lead = dataclasses.replace(self.sp, lane_half_width=self.sp.lane_half_width + self.lcp.lane_width)
+            lead = find_lead(path, s0 + self.geom.front_bumper, traffic, sp_lead)
             if lead is not None:
                 a_acc, emergency = acc_accel(lead, v, self.sp)
                 if a_acc < a_req:

@@ -100,6 +100,8 @@ class Driver:
                  fixed_target=None, fallback=None):
         self.s, self.ap = s, ap
         self.places, self.fixed_target, self.fallback = places, fixed_target, fallback
+        self._ind_on: str | None = None         # indicator AutoHaul switched on ("left"/"right")
+        self._ind_pressed = 0.0
         self.lateral, self.longitudinal = lateral, longitudinal
         d = s.cfg.get("drive", {})
         self.beeps = d.get("beeps", True)
@@ -181,8 +183,40 @@ class Driver:
             self.note(event="destination", label=target.label, x=target.x, y=target.y)
             print(f"\ndestination: {target.label}")
 
+    def indicate(self, f, want: str | None, now: float) -> None:
+        """Match the game's indicator to what the autopilot wants. The game's buttons are toggles, so compare
+        with telemetry and press only on a mismatch (at most every 0.6 s, so a press is seen before the next).
+        Only an indicator AutoHaul switched on is switched off again."""
+        if now - self._ind_pressed < 0.6:
+            return
+        state = {"left": bool(f.lblinker), "right": bool(f.rblinker)}
+        for side in ("left", "right"):
+            on = state[side]
+            if want == side and not on:
+                self.s.controls.press(f"{side[0]}blinker")
+                self._ind_on, self._ind_pressed = side, now
+                return
+            if want != side and on and self._ind_on == side:
+                self.s.controls.press(f"{side[0]}blinker")
+                self._ind_pressed = now
+                if not want:
+                    self._ind_on = None
+                return
+        if want is None and self._ind_on and not state[self._ind_on]:
+            self._ind_on = None
+
     def disengage(self, reason: str, fault: bool) -> None:
         ctl = self.s.controls
+        if self._ind_on:                            # switch AutoHaul's indicator off while controls are live
+            f = self.s.reader.read_latest()
+            if f is not None and ((self._ind_on == "left" and f.lblinker) or (self._ind_on == "right" and f.rblinker)):
+                ctl.neutral()
+                ctl.press(f"{self._ind_on[0]}blinker")
+                end = time.monotonic() + 0.15
+                while time.monotonic() < end:
+                    ctl.commit()
+                    self.s.reader.wait_frame(30)
+            self._ind_on = None
         ctl.neutral()
         ctl.set_enabled(False)
         ctl.commit()
@@ -244,6 +278,7 @@ class Driver:
                     ctl.steer(cmd.steer if self.lateral else 0.0)
                     ctl.throttle(cmd.throttle if self.longitudinal else 0.0)
                     ctl.brake(cmd.brake if self.longitudinal else 0.0)
+                    self.indicate(f, st.indicator, now)
                     ctl.commit()
                     self.last_cmd = Command(cmd.steer if self.lateral else 0.0,
                                             cmd.throttle if self.longitudinal else 0.0,
@@ -288,6 +323,8 @@ class Driver:
             if self.longitudinal:
                 lead = f" lead {st.lead.gap:4.0f} m" if st.lead else ""
                 parts.append(f"target {st.target_kmh:3.0f} ({st.target_reason}){lead} thr {st.throttle:.2f} brk {st.brake:.2f}")
+            if st.lane_change:
+                parts.append(f"lane change {st.lane_change}")
             if st.route_km is not None:
                 parts.append(f"route {st.route_km:.2f} km{' ' + st.route_note if st.route_note else ''}"
                              f"{'' if st.on_route else ' (off route)'}")

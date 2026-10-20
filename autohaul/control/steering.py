@@ -174,8 +174,10 @@ class LateralController:
                 self.ratio = _clamp(self.ratio + a * (inst - self.ratio), self.p.ratio_min, self.p.ratio_max)
 
     def step(self, pose: Pose, path: PathRef, dt: float, steer_measured: float | None = None,
-             steer_rate: float | None = None) -> LateralOut:
-        """`steer_rate`: fastest the wheel can turn, rad/s of single-track angle (None = no limit)."""
+             steer_rate: float | None = None, offset=None) -> LateralOut:
+        """`steer_rate`: fastest the wheel can turn, rad/s of single-track angle (None = no limit).
+        `offset(ds)` -> (y, dy/ds, d2y/ds2): follow the path shifted sideways (+ = right), ds metres ahead of
+        the truck's origin; used for lane changes."""
         p, g = self.p, self.geom
         if steer_measured is not None:
             self.learn(pose, steer_measured, dt)
@@ -191,9 +193,15 @@ class LateralController:
         path_rot = path.rotation_at(pr.s) if 0 <= pr.s <= path.length else pr.rotation
         psi = float(_wrap(rot - path_rot))
         lat = pr.lateral
-        kappa_ff = path.mean_curvature(pr.s, pr.s + max(v * p.ff_preview_s, 4.0))
+        y_ref = dy_ref = d2y_ref = 0.0
+        if offset is not None:
+            # evaluated where the rear axle will be: tau seconds ahead, rear_axle behind the origin
+            y_ref, dy_ref, d2y_ref = offset(v * tau - g.rear_axle)
+            lat -= y_ref
+            psi -= math.atan(dy_ref)
+        kappa_ff = path.mean_curvature(pr.s, pr.s + max(v * p.ff_preview_s, 4.0)) + d2y_ref
         omega = min(p.omega_max, v / p.d_min)
-        if v > 4.0 and abs(lat) < 1.0:
+        if v > 4.0 and abs(lat) < 1.0 and offset is None:
             self.y_int = _clamp(self.y_int + p.ki * lat * dt, -p.i_limit_m, p.i_limit_m)
         v_eff = max(v, 3.0)
         corr = -(2 * p.zeta * omega * psi + omega * omega * (lat + self.y_int) / v_eff) / v_eff

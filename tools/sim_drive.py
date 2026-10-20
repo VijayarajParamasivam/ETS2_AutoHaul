@@ -86,6 +86,7 @@ def main() -> int:
     lat, speed, target, ms, faults = [], [], [], [], []
     dist = 0.0
     last_print = 0.0
+    last_lc, changes_done = "", 0
     for _ in range(int(args.minutes * 60 / dt)):
         frame = sim.frame(args.limit_kmh / 3.6)
         cmd, st = ap.step(frame, [], dt)
@@ -99,6 +100,10 @@ def main() -> int:
                 print(f"  can't re-engage: {reason}")
                 break
             continue
+        if st.lane_change and st.lane_change != last_lc:
+            print(f"  t={sim.t:6.1f}s lane change {st.lane_change}")
+            changes_done += st.lane_change == "done"
+        last_lc = st.lane_change
         lat.append(abs(st.lateral))
         speed.append(sim.s.speed * 3.6)
         target.append(st.target_kmh)
@@ -114,7 +119,7 @@ def main() -> int:
             print(f"  stopped: {st.target_reason}")
             break
     a = np.array(lat)
-    print(f"\n{dist / 1000:.2f} km in {sim.t:.0f} s simulated; faults {len(faults)}")
+    print(f"\n{dist / 1000:.2f} km in {sim.t:.0f} s simulated; faults {len(faults)}; lane changes done {changes_done}")
     if a.size:
         print(f"lateral to lane centre: median {np.median(a):.2f} m, p95 {np.percentile(a, 95):.2f} m, max {a.max():.2f} m")
         print(f"speed mean {np.mean(speed):.1f} km/h, target mean {np.mean(target):.1f}; compute p99 {np.percentile(ms, 99):.2f} ms")
