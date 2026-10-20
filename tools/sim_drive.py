@@ -27,6 +27,10 @@ from autohaul.io.recorder import RecordingReader  # noqa: E402
 from autohaul.sim.truck import SimParams, TruckSim  # noqa: E402
 from autohaul.world.lanemap import LaneMap, heading_to_rotation  # noqa: E402
 from autohaul.world.pois import toll_plazas  # noqa: E402
+from autohaul.world.graph import LaneGraph  # noqa: E402
+from autohaul.world.junctions import Junctions  # noqa: E402
+from autohaul.world.places import Places  # noqa: E402
+from autohaul.world.route import Router  # noqa: E402
 
 
 def start_from_recording(spec: str) -> tuple[float, float, float, float]:
@@ -49,6 +53,7 @@ def main() -> int:
     ap_.add_argument("--limit-kmh", type=float, default=80.0, help="simulated posted limit")
     ap_.add_argument("--minutes", type=float, default=5.0)
     ap_.add_argument("--mass", type=float, default=30000.0)
+    ap_.add_argument("--to", help="route to CITY, CITY:COMPANY or X,Y (Phase 3)")
     args = ap_.parse_args()
     if args.from_recording:
         x, y, rot, v0 = start_from_recording(args.from_recording)
@@ -60,8 +65,18 @@ def main() -> int:
     print(f"lane map loaded in {time.time() - t0:.1f} s")
     geom = TruckGeometry()
     sim = TruckSim(geom, SimParams(mass=args.mass), x=x, y=y, rotation=rot, speed=v0)
+    router = junctions = None
+    if args.to:
+        target = Places(map_dir(cfg)).resolve(args.to)
+        if target is None:
+            print(f"unknown destination {args.to!r}")
+            return 1
+        router, junctions = Router(lm, LaneGraph.load_or_build(lm, map_dir(cfg))), Junctions(lm)
     ap = Autopilot(lm, geom, "relative", speed_params=SpeedParams(max_speed_kmh=args.limit_kmh),
-                   hazards=toll_plazas(map_dir(cfg)))
+                   hazards=toll_plazas(map_dir(cfg)), router=router, junctions=junctions)
+    if args.to:
+        ap.set_destination(target.x, target.y)
+        print(f"destination: {target.label}")
     frame = sim.frame(args.limit_kmh / 3.6)
     reason = ap.engage(frame)
     if reason:
@@ -92,8 +107,9 @@ def main() -> int:
         dist += sim.s.speed * dt
         if sim.t - last_print > 20:
             last_print = sim.t
+            route = f"  route {st.route_km:.2f} km left{' ' + st.route_note if st.route_note else ''}" if st.route_km is not None else ""
             print(f"  t={sim.t:6.0f}s {dist / 1000:5.2f} km  {sim.s.speed * 3.6:5.1f} km/h (target {st.target_kmh:4.0f}: "
-                  f"{st.target_reason})  lat {st.lateral:+.2f} m  {st.lane_desc}")
+                  f"{st.target_reason})  lat {st.lateral:+.2f} m  {st.lane_desc}{route}")
         if sim.s.speed < 0.2 and st.target_kmh < 1:
             print(f"  stopped: {st.target_reason}")
             break

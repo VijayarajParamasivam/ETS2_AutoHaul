@@ -20,8 +20,10 @@ from autohaul.control.speed import KMH, Lead, PedalController, SpeedParams, Spee
 from autohaul.control.steering import AbsoluteServo, LateralController, LateralParams, PulseModulator, RelativeServo
 from autohaul.control.vehicle import TruckGeometry, measured_steer_left, pose_from_frame
 from autohaul.safety.supervisor import Command
-from autohaul.world.lanemap import LaneMap
+from autohaul.world.lanemap import KIND_PREFAB, LaneMap
+from autohaul.world.junctions import Junctions
 from autohaul.world.localizer import LaneTracker
+from autohaul.world.route import Route, Router
 
 
 @dataclass
@@ -43,6 +45,14 @@ class AutopilotParams:
     hazard_radius_m: float = 60.0         # toll plaza icons sit within ~50 m of the booths
     hazard_lookahead_s: float = 8.0
     hazard_lookahead_m: float = 120.0
+    # Phase 3 routing
+    route_min_turn_radius_m: float = 10.0     # planned turns on the route may be this tight
+    intersection_lookahead_s: float = 8.0     # hand back this long before a junction with crossing paths
+    intersection_lookahead_m: float = 100.0
+    lane_change_handback_s: float = 8.0       # ... or before the point where the route needs a lane change
+    lane_change_handback_m: float = 150.0
+    arrive_m: float = 60.0                    # hand back this close to the destination point
+    reroute_interval_s: float = 1.0
 
 
 @dataclass
@@ -70,6 +80,9 @@ class Status:
     throttle: float = 0.0
     brake: float = 0.0
     emergency: bool = False
+    route_km: float | None = None     # remaining driving distance on the route (world km; the GPS shows ~x19)
+    on_route: bool = False
+    route_note: str = ""
     timings_ms: dict = field(default_factory=dict)
 
 
@@ -78,12 +91,13 @@ class Autopilot:
                  longitudinal: bool = True, params: AutopilotParams | None = None,
                  lat_params: LateralParams | None = None, speed_params: SpeedParams | None = None,
                  relative_gain: float = 0.42, relative_deadzone: float = 0.0, hazards: np.ndarray | None = None,
-                 pulse_steering: bool = False, check_pedals: bool = True):
-        """`pulse_steering`: relative steering as single-frame pulses (PulseModulator). Off by default: the
-        pedal loss it was meant to fix turned out to be the game taking one input event per frame (fixed in
-        the bridge DLL), and pulses spend that budget twice. `check_pedals`: fault when the game doesn't take them (off in shadow mode,
-        where nothing is sent)."""
-        """`hazards`: (n, 2) map points AutoHaul must not drive through itself, e.g. toll plazas."""
+                 pulse_steering: bool = False, check_pedals: bool = True,
+                 router: Router | None = None, junctions: Junctions | None = None):
+        """`hazards`: (n, 2) map points AutoHaul must not drive through itself, e.g. toll plazas.
+        `pulse_steering`: relative steering as single-frame pulses (PulseModulator); off by default (the pedal
+        loss it was meant to fix was the game taking one input event per frame, fixed in the bridge DLL).
+        `check_pedals`: fault when the game doesn't take AutoHaul's pedals (off in shadow mode).
+        `router` + `set_destination()`: follow a planned route; `junctions`: hand back before intersections."""
         self.lm = lm
         self.hazards = np.empty((0, 2)) if hazards is None else np.asarray(hazards, dtype=float).reshape(-1, 2)
         self.geom = geom
@@ -109,6 +123,34 @@ class Autopilot:
         self._sent = Command()
         self._pedal_miss = 0.0
         self.path: PathRef | None = None
+        self.router = router
+        self.junctions = junctions
+        self.destination: tuple[float, float] | None = None
+        self.route: Route | None = None
+        self._last_reroute = -1e9
+        self._sim_clock = 0.0
+
+    def set_destination(self, x: float, y: float) -> None:
+        self.destination = (x, y)
+        self.route = None
+
+    def _progress_m(self, st) -> float:
+        lm = self.lm
+        return float(lm.seg_len[lm.lane_first[st.lane]:st.segment].sum() + st.t * lm.seg_len[st.segment])
+
+    def _plan(self, st) -> bool:
+        if self.router is None or self.destination is None:
+            return False
+        self._last_reroute = self._sim_clock
+        self.route = self.router.route(st.lane, self._progress_m(st), self.destination)
+        return self.route is not None
+
+    def _choose(self, lane: int, succ: list[tuple[int, float]]) -> int:
+        nxt = self.route.next_after(lane) if self.route else None
+        for cand, _turn in succ:
+            if cand == nxt:
+                return cand
+        return succ[0][0]
 
     # ------------------------------------------------------------- engage
     def engage(self, frame) -> str | None:
@@ -138,14 +180,65 @@ class Autopilot:
                 return f"{abs(st.lateral):.1f} m off the lane centre; centre the truck first"
             if abs(math.degrees(st.heading_err)) > self.p.engage_max_heading_deg:
                 return f"truck is {abs(math.degrees(st.heading_err)):.0f} deg off the lane direction"
+        if st is not None and self.destination is not None:
+            if not self._plan(st):
+                return "no route from this lane to the destination"
         if st is not None and len(self.hazards):
             try:
-                path = PathRef(self.tracker.path_ahead(self.p.path_ahead_m))
+                path = PathRef(self.tracker.path_ahead(self.p.path_ahead_m, choose=self._choose if self.route else None))
             except ValueError:
                 return "no path ahead on the lane map"
             hz = self.hazard_ahead(path, path.project(pose.x, pose.y).s, max(frame.speed, 0.0))
             if hz:
                 return hz.replace(": take over", "")
+        if st is not None and self.junctions is not None:
+            try:
+                path = PathRef(self.tracker.path_ahead(self.p.path_ahead_m, choose=self._choose if self.route else None))
+            except ValueError:
+                return "no path ahead on the lane map"
+            jn = self._junction_ahead(path, path.project(pose.x, pose.y).s, max(frame.speed, 0.0))
+            if jn:
+                return jn.replace(": take over", "")
+        return None
+
+    def _junction_ahead(self, path: PathRef, s_truck: float, speed: float) -> str | None:
+        """An intersection (junction with crossing paths) on the path within the warning distance."""
+        if self.junctions is None:
+            return None
+        horizon = max(self.p.intersection_lookahead_m, self.p.intersection_lookahead_s * speed)
+        for lane in self.tracker.path_lanes:
+            if self.lm.lane_kind[lane] != KIND_PREFAB or not self.junctions.is_intersection(int(self.lm.lane_item[lane])):
+                continue
+            first = self.lm.seg[self.lm.lane_first[lane], 0:2]
+            d = path.project(float(first[0]), float(first[1])).s - s_truck
+            if d <= horizon:
+                where = "here" if d <= 0 else f"in {d:.0f} m"
+                return f"intersection {where} (traffic lights / give way not handled yet): take over"
+        return None
+
+    def _route_checks(self, st, speed: float, out: Status) -> str | None:
+        """Remaining distance, arrival, and lane changes the route needs (not automated yet)."""
+        rt, lm = self.route, self.lm
+        to_end = float(self.router.g.length[st.lane]) - self._progress_m(st)
+        rem = rt.remaining_m(st.lane, to_end)
+        if rem is not None:
+            out.route_km = rem / 1000
+            if rem <= self.p.arrive_m:
+                return "destination reached: take over"
+        horizon = max(self.p.lane_change_handback_m, self.p.lane_change_handback_s * speed)
+        i = rt.lane_index[st.lane]
+        dist = to_end                               # metres to the end of route lane j (j = i at first)
+        for j in range(i, min(i + 40, len(rt.lanes) - 1)):
+            if rt.changes[j + 1]:
+                cur, nxt = int(lm.lane_sub[rt.lanes[j]]), int(lm.lane_sub[rt.lanes[j + 1]])
+                side = "right" if abs(nxt) > abs(cur) else "left"
+                out.route_note = f"lane change {side} needed within {dist:.0f} m"
+                if dist <= horizon:
+                    return f"the route needs a lane change to the {side} (within {dist:.0f} m): take over"
+                break
+            if dist > horizon:
+                break
+            dist += float(self.router.g.length[rt.lanes[j + 1]])
         return None
 
     def hazard_ahead(self, path: PathRef, s0: float, speed: float) -> str | None:
@@ -173,7 +266,13 @@ class Autopilot:
         out = Status(speed_kmh=frame.speed * 3.6, steer_eff=frame.effective_steering)
         cmd = Command()
         pose = pose_from_frame(frame)
-        st = self.tracker.update(pose.x, pose.y, pose.rotation, prefer=self.tracker.path_lanes)
+        self._sim_clock += dt
+        prefer = self.tracker.path_lanes
+        if self.route and self.tracker.state is not None:
+            i = self.route.lane_index.get(self.tracker.state.lane)
+            if i is not None:
+                prefer = self.route.lanes[i:i + 12]
+        st = self.tracker.update(pose.x, pose.y, pose.rotation, prefer=prefer)
         t1 = clock()
         if st is None:
             self._lost += dt
@@ -188,7 +287,11 @@ class Autopilot:
         out.lane, out.lane_desc, out.confidence = st.lane, self.lm.describe(st.lane), st.confidence
         out.lateral, out.heading_err_deg = st.lateral, math.degrees(st.heading_err)
         self._low_conf = self._low_conf + dt if st.confidence < self.p.min_confidence else 0.0
-        pts = self.tracker.path_ahead(self.p.path_ahead_m)
+        if self.destination is not None and self.router is not None:
+            if (self.route is None or st.lane not in self.route.lane_index) and                     self._sim_clock - self._last_reroute >= self.p.reroute_interval_s:
+                self._plan(st)                      # off the route (or none yet): plan from here
+            out.on_route = bool(self.route and st.lane in self.route.lane_index)
+        pts = self.tracker.path_ahead(self.p.path_ahead_m, choose=self._choose if self.route else None)
         try:
             path = self.path = PathRef(pts)
         except ValueError:                      # at the very end of a lane with no mapped continuation
@@ -196,9 +299,14 @@ class Autopilot:
             self._sent = cmd
             return cmd, out
         out.path_m = path.length
-        hz = self.hazard_ahead(path, path.project(pose.x, pose.y).s, max(frame.speed, 0.0))
+        s_truck = path.project(pose.x, pose.y).s
+        hz = self.hazard_ahead(path, s_truck, max(frame.speed, 0.0))
         if hz:
             out.fault = hz
+        if not out.fault:
+            out.fault = self._junction_ahead(path, s_truck, max(frame.speed, 0.0))
+        if self.route is not None and out.on_route and not out.fault:
+            out.fault = self._route_checks(st, max(frame.speed, 0.0), out)
         t2 = clock()
 
         # --- lateral
@@ -231,7 +339,8 @@ class Autopilot:
                 if len(ss):
                     k = np.abs(np.asarray(path.curvature(ss)))
                     i = int(np.argmax(k))
-                    if k[i] > 1.0 / self.p.min_turn_radius_m:
+                    r_min = self.p.route_min_turn_radius_m if out.on_route else self.p.min_turn_radius_m
+                    if k[i] > 1.0 / r_min:
                         out.fault = f"sharp turn ahead (radius {1 / k[i]:.0f} m in {ss[i] - s0:.0f} m): take over"
         t3 = clock()
 

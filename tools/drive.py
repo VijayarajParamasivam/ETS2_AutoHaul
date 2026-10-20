@@ -3,6 +3,7 @@
     python tools/drive.py --mode speed     # AutoHaul: throttle/brake (limit, curves, following distance); you steer
     python tools/drive.py --mode steer     # AutoHaul: lane keeping; you use the pedals
     python tools/drive.py --mode full      # both
+    python tools/drive.py --to berlin:nbfc # Phase 3: follow a route (default: the active job's depot)
 
 Drive onto a mapped lane, then press the engage key ("/" by default) in the game. It toggles:
 press it again to hand back. You take over instantly, and AutoHaul disengages, when you
@@ -41,6 +42,10 @@ from autohaul.safety.mp_guard import multiplayer_reasons  # noqa: E402
 from autohaul.safety.supervisor import Command  # noqa: E402
 from autohaul.world.lanemap import LaneMap  # noqa: E402
 from autohaul.world.pois import toll_plazas  # noqa: E402
+from autohaul.world.graph import LaneGraph  # noqa: E402
+from autohaul.world.junctions import Junctions  # noqa: E402
+from autohaul.world.places import Places  # noqa: E402
+from autohaul.world.route import Router  # noqa: E402
 
 
 def beep(pattern: str, enabled: bool = True) -> None:
@@ -91,8 +96,10 @@ def preflight(s: Session, longitudinal: bool) -> list[str]:
 
 
 class Driver:
-    def __init__(self, s: Session, ap: Autopilot, lateral: bool, longitudinal: bool):
+    def __init__(self, s: Session, ap: Autopilot, lateral: bool, longitudinal: bool, places=None,
+                 fixed_target=None, fallback=None):
         self.s, self.ap = s, ap
+        self.places, self.fixed_target, self.fallback = places, fixed_target, fallback
         self.lateral, self.longitudinal = lateral, longitudinal
         d = s.cfg.get("drive", {})
         self.beeps = d.get("beeps", True)
@@ -131,6 +138,7 @@ class Driver:
             if down is not None:
                 reason = f"release the {VK_NAME.get(down, hex(down))} key first"
         if reason is None:
+            self.update_destination()
             reason = self.ap.engage(frame)
         if reason is None:
             # re-arm the bridge (clears a kill latch from earlier) and wait for the DLL to confirm
@@ -157,6 +165,21 @@ class Driver:
         self.message = "ENGAGED"
         self.note(event="engaged", mode=self.mode_name)
         beep("on", self.beeps)
+
+    def update_destination(self) -> None:
+        """Pick the destination when engaging: --to if given, else the active job's depot (the job can change
+        during a session), else --fallback-to."""
+        if self.places is None:
+            return
+        target = self.fixed_target or self.places.job_target(self.s.reader.read_config()) or self.fallback
+        if target is None:
+            if self.ap.destination is not None:
+                self.ap.destination, self.ap.route = None, None
+            return
+        if self.ap.destination != (target.x, target.y):
+            self.ap.set_destination(target.x, target.y)
+            self.note(event="destination", label=target.label, x=target.x, y=target.y)
+            print(f"\ndestination: {target.label}")
 
     def disengage(self, reason: str, fault: bool) -> None:
         ctl = self.s.controls
@@ -195,6 +218,7 @@ class Driver:
                 continue
             self._stale_since = None
             s.record_frame(f)
+            self.watch_gps(f)
             dt = 1 / 60
             if self._last_sim_us is not None and f.simulation_time_us > self._last_sim_us:
                 dt = min(0.1, max(0.001, (f.simulation_time_us - self._last_sim_us) / 1e6))
@@ -233,6 +257,19 @@ class Driver:
                 self._last_status = now
                 self.print_status(f, st)
 
+    def watch_gps(self, f) -> None:
+        """The game's GPS distance falls at local_scale x speed while the truck follows the GPS route; a jump
+        up means the game re-routed (AutoHaul left the game's route, or the GPS target changed)."""
+        nav = f.navigation_distance
+        prev = getattr(self, "_gps_prev", None)
+        self._gps_prev = nav
+        if prev is None or nav <= 0 or prev <= 0:
+            return
+        if nav - prev > 300.0:
+            self.note(event="gps_reroute", before_m=round(prev), after_m=round(nav))
+            if self.engaged:
+                self.message = f"ENGAGED (game GPS re-routed: {prev / 1000:.1f} -> {nav / 1000:.1f} km)"
+
     @staticmethod
     def note_fields(st) -> dict:
         d = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in dataclasses.asdict(st).items()
@@ -251,6 +288,9 @@ class Driver:
             if self.longitudinal:
                 lead = f" lead {st.lead.gap:4.0f} m" if st.lead else ""
                 parts.append(f"target {st.target_kmh:3.0f} ({st.target_reason}){lead} thr {st.throttle:.2f} brk {st.brake:.2f}")
+            if st.route_km is not None:
+                parts.append(f"route {st.route_km:.2f} km{' ' + st.route_note if st.route_note else ''}"
+                             f"{'' if st.on_route else ' (off route)'}")
         print("\r" + " | ".join(parts)[:200].ljust(200), end="", flush=True)
 
 
@@ -260,6 +300,9 @@ def main() -> int:
     parser.add_argument("--max-kmh", type=float, help="override drive.max_speed_kmh")
     parser.add_argument("--no-record", action="store_true")
     parser.add_argument("--minutes", type=float, default=0.0, help="quit after this long (0 = until Ctrl+C)")
+    parser.add_argument("--to", help="destination: CITY, CITY:COMPANY or X,Y (default: the active job's depot)")
+    parser.add_argument("--fallback-to", help="destination when no job is active at engage time")
+    parser.add_argument("--no-route", action="store_true", help="lane following only (Phase 2 behaviour)")
     args = parser.parse_args()
     lateral = args.mode in ("steer", "full")
     longitudinal = args.mode in ("speed", "full")
@@ -283,12 +326,27 @@ def main() -> int:
         sp = speed_params(cfg)
         if args.max_kmh:
             sp.max_speed_kmh = args.max_kmh
+        router = junctions = target = fallback = places = None
+        if not args.no_route:
+            places = Places(map_dir(cfg))
+            target = places.resolve(args.to) if args.to else None
+            fallback = places.resolve(args.fallback_to) if args.fallback_to else None
+            for spec, got in ((args.to, target), (args.fallback_to, fallback)):
+                if spec and got is None:
+                    print(f"unknown destination {spec!r} (use CITY, CITY:COMPANY or X,Y with the game's tokens)")
+                    return 1
+            router = Router(lm, LaneGraph.load_or_build(lm, map_dir(cfg)))
+            junctions = Junctions(lm)
         ap = Autopilot(lm, geom, mode, lateral=lateral, longitudinal=longitudinal, speed_params=sp,
                        relative_gain=consts.get("c_rsteersens", 0.42),
-                       relative_deadzone=d.get("relative_deadzone", 0.0), hazards=toll_plazas(map_dir(cfg)))
+                       relative_deadzone=d.get("relative_deadzone", 0.0), hazards=toll_plazas(map_dir(cfg)),
+                       router=router, junctions=junctions)
+        if router is not None:
+            print("destination: " + (target.label if target else "the active job's depot when you engage"
+                                     + (f", else {fallback.label}" if fallback else " (none: lane following)")))
         s.safety.set_axes(steering=lateral, pedals=longitudinal)
         s.safety.reset()
-        drv = Driver(s, ap, lateral, longitudinal)
+        drv = Driver(s, ap, lateral, longitudinal, places, target, fallback)
         s.recorder and s.recorder.note(event="start", mode=args.mode, steering_mode=mode,
                                        geometry=dataclasses.asdict(geom), speed=dataclasses.asdict(sp))
         print(f"truck {text(cfgb.truck.brand)} {text(cfgb.truck.name)}: wheelbase {geom.wheelbase:.2f} m; "

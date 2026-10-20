@@ -340,7 +340,7 @@ class LaneMap:
 
     def lane_points(self, lane: int) -> np.ndarray:
         """Ordered polyline of a lane, (n, 2)."""
-        segs = self.seg[self.seg_lane == lane]
+        segs = self.seg[self.lane_first[lane]:self.lane_last[lane] + 1]      # a lane's segments are contiguous
         return np.vstack([segs[:, 0:2], segs[-1:, 2:4]])
 
     def describe(self, lane: int) -> str:
