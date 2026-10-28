@@ -1,0 +1,121 @@
+diff --git a/packages/clis/parser/game-files/def-parser.ts b/packages/clis/parser/game-files/def-parser.ts
+index 0ccebf1..e1bad27 100644
+--- a/packages/clis/parser/game-files/def-parser.ts
++++ b/packages/clis/parser/game-files/def-parser.ts
+@@ -337,6 +337,8 @@ function processCountryJson(obj: CountrySii) {
+     x: rawCountry.pos[0],
+     y: rawCountry.pos[2],
+     code: rawCountry.countryCode,
++    // AutoHaul: EUR per litre of diesel
++    fuelPrice: rawCountry.fuelPrice,
+   };
+ }
+ 
+diff --git a/packages/clis/parser/game-files/prefab-ppd-parser.ts b/packages/clis/parser/game-files/prefab-ppd-parser.ts
+index 4e9c78f..fa244b7 100644
+--- a/packages/clis/parser/game-files/prefab-ppd-parser.ts
++++ b/packages/clis/parser/game-files/prefab-ppd-parser.ts
+@@ -423,6 +423,12 @@ export function parsePrefabPpd(buffer: Buffer): PrefabDescription {
+         end,
+         nextLines: rc.nextLines.slice(0, countNext),
+         prevLines: rc.prevLines.slice(0, countPrev),
++        // AutoHaul: priority (bits 16-19), blinker and vehicle-class bits
++        flags: rc.flags,
++        // AutoHaul: the `id` of the semaphores (light heads / barrier arms) controlling it, -1 if none
++        semaphoreId: rc.semaphoreId,
++        // AutoHaul: token from world/traffic_rules.sii, '' if none
++        trafficRule: rc.trafficRule as unknown as string,
+       };
+     }),
+     navNodes: rawPrefab.navNodes.map(rn => {
+@@ -442,7 +448,21 @@ export function parsePrefabPpd(buffer: Buffer): PrefabDescription {
+       };
+     }),
+     //signs: rawPrefab.signs,
+-    //semaphores: rawPrefab.semaphores,
++    // AutoHaul: traffic lights and barriers, in prefab coordinates like navCurves
++    semaphores: rawPrefab.semaphores.map(rs => {
++      const { x, y, z, rotation } = getXYZR(rs.pos, rs.rot);
++      return {
++        x,
++        y,
++        z,
++        rotation,
++        type: rs.type,
++        id: rs.id,
++        intervals: rs.intervals,
++        cycle: rs.cycle,
++        profile: rs.profile as unknown as string,
++      };
++    }),
+   };
+ }
+ 
+diff --git a/packages/clis/parser/game-files/sii-schemas.ts b/packages/clis/parser/game-files/sii-schemas.ts
+index 605636a..eef1566 100644
+--- a/packages/clis/parser/game-files/sii-schemas.ts
++++ b/packages/clis/parser/game-files/sii-schemas.ts
+@@ -501,6 +501,8 @@ export interface CountrySii {
+       countryCode: string;
+       countryId: number;
+       pos: [number, number, number];
++      // AutoHaul: EUR per litre of diesel
++      fuelPrice?: number;
+     }
+   >;
+ }
+@@ -513,7 +515,8 @@ export const CountrySiiSchema: JSONSchemaType<CountrySii> = object(
+         countryCode: string,
+         countryId: integer,
+         pos: numberTriple,
+-      }),
++        fuelPrice: { ...number, nullable: true },
++      }, ['name', 'nameLocalized', 'countryCode', 'countryId', 'pos']),
+     ),
+   },
+   [],
+diff --git a/packages/libs/map/types.ts b/packages/libs/map/types.ts
+index fc9d393..f95f581 100644
+--- a/packages/libs/map/types.ts
++++ b/packages/libs/map/types.ts
+@@ -46,6 +46,8 @@ export type Country = Readonly<{
+   y: number;
+   code: string;
+   truckSpeedLimits: SpeedLimits;
++  // AutoHaul: EUR per litre of diesel
++  fuelPrice?: number;
+ }>;
+ export type SpeedLimits = Partial<
+   Record<
+@@ -476,6 +478,23 @@ interface NavCurve {
+   };
+   nextLines: number[];
+   prevLines: number[];
++  // AutoHaul additions (optional so other producers of NavCurve still type-check)
++  flags?: number;
++  semaphoreId?: number;
++  trafficRule?: string;
++}
++export interface PrefabSemaphore {
++  x: number;
++  y: number;
++  z: number;
++  rotation: number;
++  // 0 profile, 1 model only, 2 light, 3 light minor, 4 light major, 5 barrier manual timed,
++  // 6 barrier distance, 7 light blockable, 8 barrier gas, 9 light virtual, 10 barrier automatic
++  type: number;
++  id: number;
++  intervals: [number, number, number, number];
++  cycle: number;
++  profile: string;
+ }
+ export interface PrefabDescription {
+   // prefab's entry/exit points
+@@ -502,6 +521,7 @@ export interface PrefabDescription {
+     action: string;
+   }[];
+   navCurves: NavCurve[];
++  semaphores?: PrefabSemaphore[];
+   navNodes: {
+     type: 'physical' | 'ai';
+     // if type is physical: the index of the normal node (see nodes array) this navNode ends at.

@@ -17,7 +17,7 @@ repo = "https://github.com/truckermudgeon/maps.git"
 commit = "eca70d70e8a5168f6e2b7a21c507ac7c401934d6"   # 2025-02-17, includes "support 1.53 release" (79f43437)
 submodules = true    # NVIDIA libdeflate (GDeflate decompression for HashFS v2)
 license = "GPL-3.0"
-patches = []   # Phase 2 adds nav-curve flags, semaphore IDs and fuel prices
+patches = ["patches/trucksim_maps/0001-export-junction-rules-and-fuel-prices.patch"]   # junction rules, traffic lights, fuel prices
 
 [trucklib]
 repo = "https://github.com/sk-zk/TruckLib.git"

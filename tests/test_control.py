@@ -7,14 +7,19 @@ import math
 import numpy as np
 import pytest
 
+from autohaul.control.speed import SpeedParams
 from autohaul.control.steering import RelativeServo
 from autohaul.control.vehicle import TruckGeometry, bicycle_angle, wheel_angles
-from autohaul.drive.autopilot import Autopilot
+from autohaul.drive.autopilot import Autopilot, AutopilotParams
 from autohaul.sim.course import HIGHWAY, Course, run
 from autohaul.sim.truck import SimParams, SimVehicle, TruckSim
 
 GEOM = TruckGeometry()
 KMH = 1 / 3.6
+
+
+# these tests start the truck off centre to check it comes back: no keeping the engage offset
+CENTRE = AutopilotParams(keep_engage_offset=False)
 
 
 @pytest.fixture(scope="module")
@@ -75,7 +80,7 @@ def test_hands_back_when_the_game_ignores_the_pedals(highway):
     sim = sim_at(highway, 50, y0=0.3, ignore_pedals=True)
     log = run(Autopilot(highway.lm, GEOM, "relative"), sim, highway, 30, speed_limit=80 * KMH)
     assert log.fault and log.fault.startswith("the game isn't taking AutoHaul's throttle")
-    assert log.t[-1] < 3.0
+    assert 1.5 < log.t[-1] < 3.0                 # after the grace period for the input device waking up
 
 
 def test_servo_notices_someone_else_turning_the_wheel(highway):
@@ -104,7 +109,7 @@ def test_servo_notices_someone_else_turning_the_wheel(highway):
 ], ids=["nominal", "slow-wheel", "fast-wheel", "lag", "understeer", "loaded-uphill"])
 def test_lane_keeping_on_highway_course(highway, params):
     sim = sim_at(highway, 78, y0=0.8, **params)
-    log = run(Autopilot(highway.lm, GEOM, "relative"), sim, highway, 150, speed_limit=80 * KMH)
+    log = run(Autopilot(highway.lm, GEOM, "relative", params=CENTRE), sim, highway, 150, speed_limit=80 * KMH)
     assert log.fault is None
     t, lat = log.arr("t"), np.abs(log.arr("lateral"))
     assert lat[t > 8].max() < 0.4
@@ -114,16 +119,17 @@ def test_lane_keeping_on_highway_course(highway, params):
 
 def test_game_side_deadzone_is_compensated_when_known(highway):
     sim = sim_at(highway, 78, y0=0.5, deadzone=0.16)
-    log = run(Autopilot(highway.lm, GEOM, "relative", relative_deadzone=0.16), sim, highway, 120, speed_limit=80 * KMH)
+    log = run(Autopilot(highway.lm, GEOM, "relative", relative_deadzone=0.16, params=CENTRE), sim, highway, 120,
+              speed_limit=80 * KMH)
     t, lat = log.arr("t"), np.abs(log.arr("lateral"))
     assert log.fault is None and lat[t > 8].max() < 0.4
 
 
 def test_absolute_mode(highway):
     sim = sim_at(highway, 78, y0=0.5, steering_mode="absolute")
-    log = run(Autopilot(highway.lm, GEOM, "absolute"), sim, highway, 120, speed_limit=80 * KMH)
+    log = run(Autopilot(highway.lm, GEOM, "absolute", params=CENTRE), sim, highway, 120, speed_limit=80 * KMH)
     t, lat = log.arr("t"), np.abs(log.arr("lateral"))
-    assert log.fault is None and lat[t > 8].max() < 0.4
+    assert log.fault is None and lat[t > 8].max() < 0.5          # curves at 2.0 m/s^2 now (0.4 m at 1.4)
 
 
 @pytest.mark.parametrize("mass", [9000.0, 40000.0])
@@ -164,7 +170,7 @@ def test_slows_down_before_a_tight_curve():
 
     log = run(Autopilot(course.lm, GEOM, "relative"), sim, course, 90, speed_limit=80 * KMH, every=every)
     assert log.fault is None
-    v_ok = math.sqrt(1.4 * 120) / KMH            # lat_acc_max 1.4 m/s^2 -> 46.7 km/h
+    v_ok = math.sqrt(SpeedParams().lat_acc_max * 120) / KMH   # 2.0 m/s^2 -> 55.8 km/h
     assert max(curve_speeds) < v_ok + 2.0
     assert np.abs(log.arr("lateral")).max() < 0.5
 
@@ -183,6 +189,17 @@ def test_acc_follows_then_stops_behind_a_braking_lead():
     assert gap.min() > 3.0                       # never closer than 3 m, including the hard stop
     assert v[-1] < 0.3                           # stopped behind it
     assert log.arr("brake").max() > 0.3
+
+
+def test_queues_at_the_standstill_gap_behind_a_stopped_vehicle():
+    course = Course.from_pieces([(1000, 0.0)], two_lanes=False)
+    sim = sim_at(course, 50)
+    stopped = SimVehicle(1, course.path, s=20 + 160, speed=0.0, length=16.0, width=2.5)
+    log = run(Autopilot(course.lm, GEOM, "relative"), sim, course, 40, speed_limit=80 * KMH, vehicles=[stopped])
+    assert log.fault is None
+    gap, v = log.arr("gap"), log.arr("speed")
+    assert v[-1] < 0.3
+    assert 8.0 < gap[-1] < 12.0                  # the 10 m standstill gap, not creeping closer
 
 
 def test_hands_back_well_before_a_junction_sharp_turn():
@@ -245,8 +262,9 @@ def test_stops_before_the_end_of_the_mapped_lane():
 
 def test_engage_refusals(highway):
     ap = Autopilot(highway.lm, GEOM, "relative")
-    frame = sim_at(highway, 50, y0=1.5).frame()
-    assert "off the lane centre" in ap.engage(frame)
+    frame = sim_at(highway, 50, y0=2.0).frame()
+    why = ap.engage(frame)
+    assert "off the lane centre" in why or "uncertain" in why
     frame = sim_at(highway, 50).frame()
     frame.parking_brake = 1
     assert ap.engage(frame) == "parking brake is on"

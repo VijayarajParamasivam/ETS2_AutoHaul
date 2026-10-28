@@ -6,7 +6,8 @@ target, and AutoHaul's route length should agree with it.
 
 Cost model (metres): lane length, plus a turn penalty at sharp joins, plus `lane_change_m` per lane change.
 A node is a whole lane, reached "at its end"; a lane change moves to the parallel lane of the same road,
-whose end is at the same place, so it only adds the penalty.
+whose end is at the same place, so it only adds the penalty. `no_go` lanes are never used (paths the map
+reserves for cars, e.g. the car pumps of a fuel station).
 """
 
 from __future__ import annotations
@@ -55,9 +56,15 @@ class Route:
 
 
 class Router:
-    def __init__(self, lm: LaneMap, graph: LaneGraph, lane_change_m: float = 80.0, turn_penalty_m_per_rad: float = 20.0):
+    def __init__(self, lm: LaneMap, graph: LaneGraph, lane_change_m: float = 80.0, turn_penalty_m_per_rad: float = 20.0,
+                 no_go: np.ndarray | None = None, snap_m: float = 2000.0, weight: np.ndarray | None = None):
+        """`weight`: per lane, what a metre of it costs (city_weights: 3/19 inside a city area, 1 outside). The
+        game's GPS counts distance in game km, and a city metre is 3 game metres against 19 on the open road;
+        unweighted, AutoHaul took routes the GPS doesn't (a U-turn out of Rotterdam instead of through it)."""
         self.lm = lm
         self.g = graph
+        self.snap_m = snap_m          # no lane near the destination point (a city centre): the nearest within this
+        self._no_go = (np.zeros(len(graph.length), dtype=bool) if no_go is None else np.asarray(no_go, bool)).tolist()
         self.lane_change_m = lane_change_m
         self.turn_penalty = turn_penalty_m_per_rad
         # plain Python lists: much faster than numpy scalars inside the search loop
@@ -65,6 +72,9 @@ class Router:
         self._ex = lm.seg[last, 2].tolist()
         self._ey = lm.seg[last, 3].tolist()
         self._len = graph.length.tolist()
+        w = np.ones(len(graph.length)) if weight is None else np.asarray(weight, float)
+        self._cost = (graph.length * w).tolist()
+        self._h = float(w.min()) if len(w) else 1.0          # admissible: no metre costs less than this
         self._sp = graph.succ_ptr.tolist()
         self._si = graph.succ_idx.tolist()
         self._st = graph.succ_turn.tolist()
@@ -87,26 +97,46 @@ class Router:
                 break
             seg = int(idx[j])
             lane = int(self.lm.seg_lane[seg])
-            if lane in out:
+            if lane in out or self._no_go[lane]:
                 continue
             # metres from the closest point to the lane's end
             rest = float(self.lm.seg_len[seg] * (1 - t[j]) + self.lm.seg_len[seg + 1:self.lm.lane_last[lane] + 1].sum())
             out[lane] = rest
         return out
 
+    def nearest_road_point(self, x: float, y: float, max_dist: float) -> tuple[float, float] | None:
+        """The closest point on a drivable lane within `max_dist` of (x, y), or None. Scans every segment
+        (~30 ms), so only for destinations without a lane nearby."""
+        s = self.lm.seg
+        mx, my = (s[:, 0] + s[:, 2]) / 2, (s[:, 1] + s[:, 3]) / 2
+        d = np.hypot(mx - x, my - y)
+        d[np.asarray(self._no_go)[self.lm.seg_lane]] = np.inf
+        i = int(np.argmin(d))
+        return (float(mx[i]), float(my[i])) if d[i] <= max_dist else None
+
     def route(self, start_lane: int, start_progress_m: float, target: tuple[float, float], goal_radius: float = 60.0,
-              max_expand: int = 3_000_000) -> Route | None:
-        """Route from `start_progress_m` metres along `start_lane` to the destination point."""
+              max_expand: int = 3_000_000, goal: tuple[int, float] | None = None,
+              no_change_m: float = 0.0) -> Route | None:
+        """Route from `start_progress_m` metres along `start_lane` to the destination point: any lane passing
+        within `goal_radius` of it, or exactly `goal` = (lane, metres along it) when given (a fuel pump).
+        `no_change_m`: no lane changes in the first metres (there's no room left for one: stay in lane)."""
         tx, ty = target
-        goals = self.goal_lanes(tx, ty, goal_radius)
+        if goal is not None:
+            goals = {goal[0]: max(self._len[goal[0]] - goal[1], 0.0)}
+        else:
+            goals = self.goal_lanes(tx, ty, goal_radius)
+            if not goals and self.snap_m > goal_radius:
+                near = self.nearest_road_point(tx, ty, self.snap_m)
+                goals = self.goal_lanes(near[0], near[1], goal_radius) if near else {}
         if not goals:
             return None
-        ex, ey, ln_len = self._ex, self._ey, self._len
+        ex, ey, ln_len, cost, no_go, hw = self._ex, self._ey, self._len, self._cost, self._no_go, self._h
         sp, si, st, np_, ni = self._sp, self._si, self._st, self._np, self._ni
         g0 = max(ln_len[start_lane] - start_progress_m, 0.0)
-        best = {start_lane: g0}
+        c0 = g0 * (cost[start_lane] / ln_len[start_lane] if ln_len[start_lane] > 0 else 1.0)
+        best = {start_lane: c0}
         parent: dict[int, tuple[int, bool]] = {}
-        heap = [(g0 + math.hypot(ex[start_lane] - tx, ey[start_lane] - ty), g0, start_lane)]
+        heap = [(c0 + hw * math.hypot(ex[start_lane] - tx, ey[start_lane] - ty), c0, start_lane)]
         expanded = 0
         while heap:
             f, g, lane = heapq.heappop(heap)
@@ -119,18 +149,22 @@ class Router:
                 return None
             for k in range(sp[lane], sp[lane + 1]):
                 nxt = si[k]
-                ng = g + ln_len[nxt] + self.turn_penalty * abs(st[k])
+                if no_go[nxt]:
+                    continue
+                ng = g + cost[nxt] + self.turn_penalty * abs(st[k])
                 if ng < best.get(nxt, math.inf):
                     best[nxt] = ng
                     parent[nxt] = (lane, False)
-                    heapq.heappush(heap, (ng + math.hypot(ex[nxt] - tx, ey[nxt] - ty), ng, nxt))
+                    heapq.heappush(heap, (ng + hw * math.hypot(ex[nxt] - tx, ey[nxt] - ty), ng, nxt))
             for k in range(np_[lane], np_[lane + 1]):
                 nxt = ni[k]
+                if no_go[nxt] or g < no_change_m:
+                    continue
                 ng = g + self.lane_change_m
                 if ng < best.get(nxt, math.inf):
                     best[nxt] = ng
                     parent[nxt] = (lane, True)
-                    heapq.heappush(heap, (ng + math.hypot(ex[nxt] - tx, ey[nxt] - ty), ng, nxt))
+                    heapq.heappush(heap, (ng + hw * math.hypot(ex[nxt] - tx, ey[nxt] - ty), ng, nxt))
         return None
 
     def _make(self, goal: int, parent: dict, g0: float, goal_rest: float, target, expanded: int) -> Route:

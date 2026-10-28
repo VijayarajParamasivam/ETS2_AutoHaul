@@ -191,13 +191,25 @@ def test_gap_check_sides_and_distances():
     assert check(_veh(1, 0.0, 12.0, 20.0)) is None                          # two lanes over
 
 
-def test_lane_change_waits_for_a_gap_then_hands_back_if_none(junction):
+def test_lane_change_waits_for_a_gap_then_makes_a_short_change(junction):
+    """A vehicle alongside at the same speed: the truck waits; slowing for the split it lets the vehicle go ahead,
+    then changes in the room left (2026-10-29: a short change instead of a long way round)."""
     from autohaul.control.path import PathRef
     from autohaul.sim.truck import SimVehicle
     lm, g = junction
     right = PathRef(lm.lane_points(1))
     blocker = SimVehicle(1, right, s=20.0, speed=60 / 3.6, length=16.0, width=2.5)   # alongside, same speed
     lanes, fault, ap = _drive(lm, g, 0, tuple(lm.lane_points(4)[-40]), traffic=[blocker])
+    assert fault == "destination reached: take over" and lanes[:2] == [0, 1]
+
+
+def test_lane_change_hands_back_if_no_gap_ever_opens(junction):
+    from autohaul.control.path import PathRef
+    from autohaul.sim.truck import SimVehicle
+    lm, g = junction
+    right = PathRef(lm.lane_points(1))
+    parked = SimVehicle(1, right, s=right.length / 2, speed=0.0, length=right.length - 10.0, width=2.5)  # a queue
+    lanes, fault, ap = _drive(lm, g, 0, tuple(lm.lane_points(4)[-40]), traffic=[parked], seconds=90.0)
     assert fault and fault.startswith("no room left to change lanes to the right")
     assert lanes == [0]
 

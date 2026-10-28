@@ -54,13 +54,53 @@ require_traffic_data = true       # refuse speed control without the ETS2LA traf
 steer_deg_per_unit = 38.0         # single-track wheel angle per unit of effective steering (measured)
 relative_deadzone = 0.0           # game-side steering-axis deadzone; measure with tools/steer_ident.py
 front_overhang_m = 1.45           # front axle to bumper (following distance is measured from the bumper)
+auto_headlights = true            # low beam on from 20:00 to 07:00 game time while AutoHaul drives
+traffic_lights = true             # read traffic lights from the screen: stop on red/amber, go on green
+tolls = true                      # toll gates: stop at the booth, press activate to pay, drive through
+refocus_game = true               # another window took the focus while engaged: bring the game back to the front
+refocus_grace_s = 0.5             # ... and hand back if that hasn't worked by then (it keeps trying for 10 s)
 # Speed planning (autohaul/control/speed.py SpeedParams; any field there can be set here)
 max_speed_kmh = 80.0
 limit_margin_kmh = 2.0            # drive this much under the posted limit
 unknown_limit_kmh = 60.0          # when the game reports no limit
-lat_acc_max = 1.4                 # m/s^2 in curves
+lat_acc_max = 2.0                 # m/s^2 in curves (you drive up to ~2.6 at 25-50 km/h; was 1.4: slow)
 acc_time_gap_s = 2.2              # following distance = standstill gap + time gap x speed
 acc_standstill_m = 10.0
+
+[drive.give_way]
+# Junction rules (Phase 3; autohaul/control/giveway.py GiveWayParams, any field there can be set here)
+yield_margin_s = 3.0              # traffic with right of way must reach the conflict this long after we've cleared it
+approach_kmh = 15.0               # top speed at a give-way line
+inside_kmh = 20.0                 # top speed inside an intersection
+inside_lat_acc = 1.4              # m/s^2 in intersection turns (you take ~1.2 below 25 km/h; was 0.7: crawling)
+own_accel = 0.5                   # m/s^2 the truck is assumed to pull away with (lower = more careful)
+max_wait_s = 45.0                 # hand back after waiting this long at one junction
+
+[mission]
+# Phase 4, tools/drive.py --mission (autohaul/mission/: MissionParams and PlannerParams fields can be set here)
+fatigue = "auto"                  # "auto": plan rests only if the game's rest timer runs; "on" / "off" to force
+quick_park = true                 # at the depots: try the game's quick park (Q) to deliver / hook up the trailer
+reserve_km = 150.0                # game km of fuel always kept in the tank
+rest_buffer_min = 60.0            # reach a place to sleep this long before the rest timer runs out
+corridor_m = 400.0                # stops up to this far (world m, ~8 game km) from the route count
+refuel_min = 15.0                 # game minutes a refuel takes (for the deadline estimate)
+sleep_min = 540.0                 # ... and a sleep
+replan_m = 1500.0                 # re-plan stops every this many world metres (~28 game km)
+
+[mission.economics]
+# What a plan is worth (autohaul/mission/economics.py); refitted from logs/jobs.jsonl once there are deliveries
+late_fixed = 0.2                  # share of income lost for being late at all ...
+late_per_hour = 0.05              # ... plus this per game hour late
+late_floor = 0.3
+time_value_eur_h = 600.0          # what a game hour of the truck is worth
+
+[mission.actions]
+# The refuel / sleep scripts (autohaul/mission/actions.py): virtual buttons and timings
+activate = "activate"
+confirm = "selectfcs"
+refuel_modes = ["hold", "press"]  # 1.53.2.1 fills while activate (Enter) is held (checked in-game); a press as fallback
+flow_wait_s = 3.0                 # fuel must start flowing this soon in each mode
+sleep_wait_s = 20.0               # the game clock must jump this soon after confirming the sleep
 
 [recorder]
 enabled = true

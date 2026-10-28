@@ -18,19 +18,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np  # noqa: E402
 
+from autohaul.control.giveway import GiveWayParams  # noqa: E402
 from autohaul.control.speed import SpeedParams  # noqa: E402
 from autohaul.control.vehicle import TruckGeometry  # noqa: E402
 from autohaul.drive.autopilot import Autopilot  # noqa: E402
 from autohaul.infra.config import load_config  # noqa: E402
 from autohaul.infra.paths import map_dir, recordings_dir  # noqa: E402
 from autohaul.io.recorder import RecordingReader  # noqa: E402
+from autohaul.sim.lights import CycledLights  # noqa: E402
 from autohaul.sim.truck import SimParams, TruckSim  # noqa: E402
+from autohaul.world.bundle import load_world  # noqa: E402
 from autohaul.world.lanemap import LaneMap, heading_to_rotation  # noqa: E402
 from autohaul.world.pois import toll_plazas  # noqa: E402
-from autohaul.world.graph import LaneGraph  # noqa: E402
-from autohaul.world.junctions import Junctions  # noqa: E402
 from autohaul.world.places import Places  # noqa: E402
-from autohaul.world.route import Router  # noqa: E402
 
 
 def start_from_recording(spec: str) -> tuple[float, float, float, float]:
@@ -54,6 +54,12 @@ def main() -> int:
     ap_.add_argument("--minutes", type=float, default=5.0)
     ap_.add_argument("--mass", type=float, default=30000.0)
     ap_.add_argument("--to", help="route to CITY, CITY:COMPANY or X,Y (Phase 3)")
+    ap_.add_argument("--no-rules", action="store_true", help="hand back before every intersection (no give way)")
+    ap_.add_argument("--lights", choices=["cycle", "none"], default="cycle",
+                     help="traffic lights: cycle green/amber/red per junction (default), or none (hand back)")
+    ap_.add_argument("--trace-from", type=float, default=None, help="print every step's notes from this sim time (s)")
+    ap_.add_argument("--set", action="append", default=[], metavar="FIELD=VALUE",
+                     help="override a SpeedParams or GiveWayParams field, e.g. --set lat_acc_max=2.0")
     args = ap_.parse_args()
     if args.from_recording:
         x, y, rot, v0 = start_from_recording(args.from_recording)
@@ -65,15 +71,30 @@ def main() -> int:
     print(f"lane map loaded in {time.time() - t0:.1f} s")
     geom = TruckGeometry()
     sim = TruckSim(geom, SimParams(mass=args.mass), x=x, y=y, rotation=rot, speed=v0)
-    router = junctions = None
+    router = junctions = rules = None
     if args.to:
         target = Places(map_dir(cfg)).resolve(args.to)
         if target is None:
             print(f"unknown destination {args.to!r}")
             return 1
-        router, junctions = Router(lm, LaneGraph.load_or_build(lm, map_dir(cfg))), Junctions(lm)
-    ap = Autopilot(lm, geom, "relative", speed_params=SpeedParams(max_speed_kmh=args.limit_kmh),
-                   hazards=toll_plazas(map_dir(cfg)), router=router, junctions=junctions)
+        world = load_world(map_dir(cfg), lm, rules=not args.no_rules)
+        router, junctions, rules = world.router, world.junctions, world.rules
+    sp, gwp = SpeedParams(max_speed_kmh=args.limit_kmh), GiveWayParams()
+    for item in args.set:
+        name, value = item.split("=", 1)
+        target_params = sp if hasattr(sp, name) else gwp
+        if not hasattr(target_params, name):
+            print(f"unknown field {name!r}")
+            return 1
+        setattr(target_params, name, type(getattr(target_params, name))(value))
+    ap = Autopilot(lm, geom, "relative", speed_params=sp, hazards=toll_plazas(map_dir(cfg)), router=router,
+                   junctions=junctions, rules=rules, give_way=gwp)
+    lights = None
+    if rules is not None:
+        ap.set_tolls(True)                          # the simulated booth takes payment a second after `activate`
+    if rules is not None and args.lights == "cycle":
+        lights = CycledLights(rules, lambda: sim.t)
+        ap.set_lights(lights)
     if args.to:
         ap.set_destination(target.x, target.y)
         print(f"destination: {target.label}")
@@ -87,6 +108,9 @@ def main() -> int:
     dist = 0.0
     last_print = 0.0
     last_lc, changes_done = "", 0
+    last_jn = ""
+    front_lane, entries = None, {}
+    pay_at = None                  # light colour when the front bumper entered a lit junction path
     for _ in range(int(args.minutes * 60 / dt)):
         frame = sim.frame(args.limit_kmh / 3.6)
         cmd, st = ap.step(frame, [], dt)
@@ -100,10 +124,37 @@ def main() -> int:
                 print(f"  can't re-engage: {reason}")
                 break
             continue
+        if args.trace_from is not None and sim.t >= args.trace_from and int(sim.t * 10) % 5 == 0:
+            print(f"  t={sim.t:6.1f}s {sim.s.speed * 3.6:5.1f} km/h tgt {st.target_kmh:4.0f} ({st.target_reason}) lc={st.lane_change!r} "
+                  f"note={st.route_note!r} jn={st.junction!r} lat {st.lateral:+.2f} {st.lane_desc}")
+        if "activate" in st.press:
+            pay_at = sim.t + 1.0
+            print(f"  t={sim.t:6.1f}s pressed activate at {sim.s.speed * 3.6:.1f} km/h ({st.junction})")
+        if pay_at is not None and sim.t >= pay_at:
+            ap.toll_paid()
+            pay_at = None
+            print(f"  t={sim.t:6.1f}s toll paid")
         if st.lane_change and st.lane_change != last_lc:
             print(f"  t={sim.t:6.1f}s lane change {st.lane_change}")
             changes_done += st.lane_change == "done"
         last_lc = st.lane_change
+        jn = st.junction.split(" (")[0]
+        if jn != last_jn:
+            print(f"  t={sim.t:6.1f}s junction: {st.junction or '-'}  {sim.s.speed * 3.6:4.1f} km/h  {st.lane_desc}")
+            last_jn = jn
+        if lights is not None:
+            fx = sim.s.x + geom.front_bumper * math.cos(sim.s.rotation)
+            fy = sim.s.y + geom.front_bumper * math.sin(sim.s.rotation)
+            on = set(ap.tracker.path_lanes)
+            hits = [h for h in lm.nearest(fx, fy, sim.s.rotation, max_dist=2.0, k=6) if h.lane in on]
+            fl = hits[0].lane if hits else None
+            if fl is not None and fl != front_lane and ap.gw.light(fl, int(lm.lane_item[fl])):
+                colour = lights.state(fl, int(lm.lane_item[fl]))
+                entries[colour] = entries.get(colour, 0) + 1
+                if colour != "green":
+                    print(f"  t={sim.t:6.1f}s entered a junction on {colour.upper()} at {sim.s.speed * 3.6:.1f} km/h "
+                          f"({st.junction})")
+            front_lane = fl
         lat.append(abs(st.lateral))
         speed.append(sim.s.speed * 3.6)
         target.append(st.target_kmh)
@@ -115,10 +166,12 @@ def main() -> int:
             route = f"  route {st.route_km:.2f} km left{' ' + st.route_note if st.route_note else ''}" if st.route_km is not None else ""
             print(f"  t={sim.t:6.0f}s {dist / 1000:5.2f} km  {sim.s.speed * 3.6:5.1f} km/h (target {st.target_kmh:4.0f}: "
                   f"{st.target_reason})  lat {st.lateral:+.2f} m  {st.lane_desc}{route}")
-        if sim.s.speed < 0.2 and st.target_kmh < 1:
+        if sim.s.speed < 0.2 and st.target_kmh < 1 and not st.junction:
             print(f"  stopped: {st.target_reason}")
-            break
+            break                                   # standing for good (waiting at a junction ends by itself)
     a = np.array(lat)
+    if lights is not None:
+        print("lit junction entries by colour:", entries or "none")
     print(f"\n{dist / 1000:.2f} km in {sim.t:.0f} s simulated; faults {len(faults)}; lane changes done {changes_done}")
     if a.size:
         print(f"lateral to lane centre: median {np.median(a):.2f} m, p95 {np.percentile(a, 95):.2f} m, max {a.max():.2f} m")

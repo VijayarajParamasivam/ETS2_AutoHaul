@@ -30,6 +30,12 @@ class LaneChangeParams:
     tractor_rear_m: float = 3.5        # our rear end behind the origin: tractor only ...
     trailer_rear_m: float = 17.0       # ... and with a semi-trailer
     deadline_margin_m: float = 20.0    # the move must end this far before the lane does
+    reroute_max_extra_m: float = 1500.0   # no room for the change: a way on from this lane may be this much ...
+    reroute_max_extra_share: float = 0.25  # ... or this share of the remaining route longer (2026-10-29: a
+                                           # 15 km detour was taken instead of merging off a 98 m slip lane)
+    short_len_m: float = 35.0          # otherwise squeeze the change into what's left, down to this length
+    short_signal_s: float = 1.0        # ... with a shorter signal
+    stand_wait_s: float = 30.0         # standing this long waiting for a gap: hand back
 
 
 def quintic(u: float) -> tuple[float, float, float]:
@@ -88,6 +94,7 @@ class LaneChange:
     length: float = 0.0
     profile: object = None
     waiting: str = ""          # why it hasn't moved yet
+    stood_since: float | None = None   # autopilot clock since the truck stands waiting for a gap
 
     @property
     def side_name(self) -> str:

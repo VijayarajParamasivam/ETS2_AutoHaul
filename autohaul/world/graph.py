@@ -1,7 +1,7 @@
 """Lane connection graph over the LaneMap, for routing.
 
 For every lane:
-  successors   lanes that continue it (their start within 1.5 m of its end, turning at most 40 degrees),
+  successors   lanes that continue it (their start within 2.5 m of its end, turning at most 40 degrees),
                sorted by turn angle - the same rule as LaneMap.successors, computed for all lanes at once
   neighbours   parallel lanes of the same road in the same direction (one lane-change step left/right)
 Stored as CSR arrays and cached next to the lane map (`lanes_graph.npz`), keyed by the lane map's build time.
@@ -12,15 +12,15 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 from autohaul.world.lanemap import KIND_ROAD, LaneMap, wrap
 
-GRAPH_VERSION = 1
-MAX_GAP_M = 1.5
+GRAPH_VERSION = 2
+MAX_GAP_M = 2.5          # lane-map seams up to ~1.6 m exist (Amsterdam); a lane width is 4.5 m
 MAX_TURN = math.radians(40)
 
 
@@ -33,9 +33,20 @@ class LaneGraph:
     nbr_idx: np.ndarray       # (N,) int32, parallel same-direction lanes of the same road
     length: np.ndarray        # (L,) float32 lane length (m)
     meta: dict
+    _pred: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def successors(self, lane: int) -> np.ndarray:
         return self.succ_idx[self.succ_ptr[lane]:self.succ_ptr[lane + 1]]
+
+    def predecessors(self, lane: int) -> np.ndarray:
+        """Lanes that lead into `lane` (the reverse links, built on first use)."""
+        if self._pred is None:
+            src = np.repeat(np.arange(len(self.length), dtype=np.int32), np.diff(self.succ_ptr))
+            order = np.argsort(self.succ_idx, kind="stable")
+            ptr = np.searchsorted(self.succ_idx[order], np.arange(len(self.length) + 1)).astype(np.int64)
+            self._pred = (ptr, src[order])
+        ptr, idx = self._pred
+        return idx[ptr[lane]:ptr[lane + 1]]
 
     def neighbours(self, lane: int) -> np.ndarray:
         return self.nbr_idx[self.nbr_ptr[lane]:self.nbr_ptr[lane + 1]]
@@ -73,7 +84,8 @@ class LaneGraph:
                 within = np.arange(c.sum()) - np.repeat(np.cumsum(c) - c, c)
                 pa.append(a)
                 pb.append(order[np.repeat(lo[has], c) + within])
-        a, b = np.concatenate(pa), np.concatenate(pb)
+        a = np.concatenate(pa) if pa else np.zeros(0, np.int64)
+        b = np.concatenate(pb) if pb else np.zeros(0, np.int64)
         gap = np.hypot(sx[b] - ex[a], sy[b] - ey[a])
         turn = wrap(srot[b] - erot[a])
         ok = (a != b) & (gap <= MAX_GAP_M) & (np.abs(turn) <= MAX_TURN)

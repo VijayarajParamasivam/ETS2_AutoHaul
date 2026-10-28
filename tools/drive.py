@@ -4,6 +4,7 @@
     python tools/drive.py --mode steer     # AutoHaul: lane keeping; you use the pedals
     python tools/drive.py --mode full      # both
     python tools/drive.py --to berlin:nbfc # Phase 3: follow a route (default: the active job's depot)
+    python tools/drive.py --mission        # Phase 4: run the active job: fuel and rest stops, decision log
 
 Drive onto a mapped lane, then press the engage key ("/" by default) in the game. It toggles:
 press it again to hand back. You take over instantly, and AutoHaul disengages, when you
@@ -11,7 +12,10 @@ press it again to hand back. You take over instantly, and AutoHaul disengages, w
     pedals), move the controller stick or a trigger,
   * press the kill key (backslash or Pause) or BACK+START on the controller,
 and it hands back by itself on any fault (lane lost, uncertain lane, off centre, someone else steering,
-pause, lost focus, stale telemetry). Beeps: rising = engaged, falling = handed back, rapid = fault.
+pause, stale telemetry). Beeps: rising = engaged, falling = handed back, rapid = fault.
+If another window takes the focus while AutoHaul drives, it brings the game straight back to the front: the
+game ignores all input while it isn't focused and keeps the last throttle and steering. Press the engage key
+to hand back before you use another window.
 Everything is recorded (frames + autopilot notes) to <cache>/recordings/.
 """
 
@@ -27,25 +31,34 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from autohaul.control.giveway import GiveWayParams  # noqa: E402
 from autohaul.control.speed import SpeedParams  # noqa: E402
 from autohaul.control.vehicle import TruckGeometry  # noqa: E402
 from autohaul.drive.autopilot import Autopilot  # noqa: E402
-from autohaul.infra.gameenv import active_controls_file, controls_constants, steering_mode  # noqa: E402
-from autohaul.infra.paths import map_dir  # noqa: E402
+from autohaul.drive.keeper import Keeper, KeeperParams  # noqa: E402
+from autohaul.drive.lights import Headlights  # noqa: E402
+from autohaul.infra.gameenv import active_controls_file, controls_constants, profile_setting, steering_mode  # noqa: E402
+from autohaul.infra.paths import logs_dir, map_dir  # noqa: E402
 from autohaul.infra.session import Session, enable_ansi  # noqa: E402
 from autohaul.io import _layout as L  # noqa: E402
 from autohaul.io.gamedata import GameDataReader  # noqa: E402
 from autohaul.io.telemetry import text  # noqa: E402
-from autohaul.io.win32 import foreground_pid  # noqa: E402
+from autohaul.io.win32 import bring_to_front, foreground_pid  # noqa: E402
+from autohaul.vision.camera import Camera  # noqa: E402
+from autohaul.vision.lights import LightVision  # noqa: E402
+from autohaul.vision.screen import GameScreen  # noqa: E402
+from autohaul.mission.decisions import DecisionLog  # noqa: E402
+from autohaul.mission.job import JobHistory  # noqa: E402
+from autohaul.mission.manager import Mission, MissionDriver  # noqa: E402
+from autohaul.mission.settings import mission_settings  # noqa: E402
 from autohaul.safety.keys import VK_NAME, vk  # noqa: E402
 from autohaul.safety.mp_guard import multiplayer_reasons  # noqa: E402
 from autohaul.safety.supervisor import Command  # noqa: E402
+from autohaul.world.bundle import load_world  # noqa: E402
 from autohaul.world.lanemap import LaneMap  # noqa: E402
 from autohaul.world.pois import toll_plazas  # noqa: E402
-from autohaul.world.graph import LaneGraph  # noqa: E402
-from autohaul.world.junctions import Junctions  # noqa: E402
 from autohaul.world.places import Places  # noqa: E402
-from autohaul.world.route import Router  # noqa: E402
+from autohaul.world.services import Services  # noqa: E402
 
 
 def beep(pattern: str, enabled: bool = True) -> None:
@@ -69,6 +82,12 @@ def speed_params(cfg) -> SpeedParams:
     d = cfg.get("drive", {})
     names = {f.name for f in dataclasses.fields(SpeedParams)}
     return SpeedParams(**{k: v for k, v in d.items() if k in names})
+
+
+def give_way_params(cfg) -> GiveWayParams:
+    d = cfg.get("drive", {}).get("give_way", {})
+    names = {f.name for f in dataclasses.fields(GiveWayParams)}
+    return GiveWayParams(**{k: v for k, v in d.items() if k in names})
 
 
 def preflight(s: Session, longitudinal: bool) -> list[str]:
@@ -97,18 +116,31 @@ def preflight(s: Session, longitudinal: bool) -> list[str]:
 
 class Driver:
     def __init__(self, s: Session, ap: Autopilot, lateral: bool, longitudinal: bool, places=None,
-                 fixed_target=None, fallback=None):
-        self.s, self.ap = s, ap
+                 fixed_target=None, fallback=None, mission: MissionDriver | None = None):
+        self.s, self.ap, self.md = s, ap, mission
+        self.lateral, self.longitudinal = lateral, longitudinal
+        self.headlights = Headlights() if s.cfg.get("drive", {}).get("auto_headlights", True) else None
+        kp = {k: v for k, v in s.cfg.get("drive", {}).get("keeper", {}).items() if hasattr(KeeperParams, k)}
+        self.keeper = Keeper(KeeperParams(**kp)) if longitudinal else None
+        if self.keeper is not None:
+            ap.p.ready_check = False             # the keeper releases the parking brake and shifts to drive
+        self._unfocused_at: float | None = None  # engaged and another window in front since
+        self._refocus_until = 0.0                # after a hand-back: keep pulling the game to the front until
+        self._refocus_tried = -1e9
+        self._kept_hold: str | None = None       # a button the keeper is holding (the engine starter)
+        self._kept_msg = False                   # the status message is the keeper's
+        self.mission_status = None
         self.places, self.fixed_target, self.fallback = places, fixed_target, fallback
         self._ind_on: str | None = None         # indicator AutoHaul switched on ("left"/"right")
         self._ind_pressed = 0.0
-        self.lateral, self.longitudinal = lateral, longitudinal
         d = s.cfg.get("drive", {})
         self.beeps = d.get("beeps", True)
         self.require_traffic = d.get("require_traffic_data", True)
         self.engage_vk = vk(d.get("engage_key", "SLASH"))
         self.status_period = 1.0 / d.get("status_hz", 5)
         self.stale_abort_s = s.cfg.get("safety.telemetry_stale_abort_ms", 1000) / 1000
+        self.refocus = d.get("refocus_game", True)
+        self.refocus_grace_s = d.get("refocus_grace_s", 0.5)
         self.gd = GameDataReader()
         self.engaged = False
         self.last_cmd = Command()
@@ -139,7 +171,12 @@ class Driver:
             down = s.keyboard.state.any_down(s.safety.override_vks)
             if down is not None:
                 reason = f"release the {VK_NAME.get(down, hex(down))} key first"
-        if reason is None:
+        if reason is None and self.md is not None:
+            if self.md.m.target() is None:
+                reason = "no active job (accept one, or start with --to CITY to drive somewhere without one)"
+            else:
+                reason = self.md.engage(frame)
+        elif reason is None:
             self.update_destination()
             reason = self.ap.engage(frame)
         if reason is None:
@@ -162,6 +199,8 @@ class Driver:
         s.safety.reset()
         ctl.set_enabled(True)
         self.engaged = True
+        if self.keeper is not None:
+            self.keeper.reset()
         self.last_cmd = Command()
         self.stats["engagements"] += 1
         self.message = "ENGAGED"
@@ -205,6 +244,64 @@ class Driver:
         if want is None and self._ind_on and not state[self._ind_on]:
             self._ind_on = None
 
+    def keep_focus(self, now: float) -> bool:
+        """Engaged: True while the game window is in front, or was brought back within the grace time. The game
+        reads no input while another window is in front and keeps the last throttle and steering, so a click on
+        another window would leave the truck at full throttle (the crash of 2026-10-23)."""
+        game = self.s.reader.header().game_pid
+        if foreground_pid() == game:
+            if self._unfocused_at is not None:
+                gone = now - self._unfocused_at
+                self._unfocused_at = None
+                self.note(event="refocused", after_s=round(gone, 3))
+                self.message = "ENGAGED (brought the game back to the front: press / to hand back first)"
+            return True
+        if not self.refocus:
+            return False
+        if self._unfocused_at is None:
+            self._unfocused_at = now
+            self.note(event="focus_lost", foreground_pid=foreground_pid())
+        if now - self._refocus_tried > 0.1:
+            self._refocus_tried = now
+            bring_to_front(game)
+        return foreground_pid() == game or now - self._unfocused_at < self.refocus_grace_s
+
+    def refocus_after_handback(self, now: float) -> None:
+        """After a focus-loss hand-back the released controls reach the game only once it's in front again."""
+        if now >= self._refocus_until or now - self._refocus_tried < 0.2:
+            return
+        game = self.s.reader.header().game_pid
+        if foreground_pid() == game:
+            self._refocus_until = 0.0
+            return
+        self._refocus_tried = now
+        bring_to_front(game)
+
+    def keep_truck_ready(self, f, cmd, dt: float, now: float):
+        """Engine on, parking brake off, gearbox in drive (autohaul/drive/keeper.py). Returns the command to send
+        (held on the brake while something isn't ready) and a failure to hand back with, or None."""
+        if self.keeper is None:
+            return cmd, None
+        k = self.keeper.step(f, cmd.throttle > 0.2, dt, now)
+        ctl = self.s.controls
+        if k.press:
+            ctl.press(k.press)
+            self.note(event="keeper", action=k.press, reason=k.problem)
+        if k.hold and k.hold != self._kept_hold:
+            self.note(event="keeper", action=f"hold {k.hold}", reason=k.problem)
+        if self._kept_hold and self._kept_hold != k.hold:
+            ctl.hold(self._kept_hold, False)
+        if k.hold:
+            ctl.hold(k.hold, True)
+        self._kept_hold = k.hold
+        if k.problem:
+            self.message = f"ENGAGED ({k.problem})"
+            cmd = dataclasses.replace(cmd, throttle=0.0, brake=max(cmd.brake, 0.3))
+        elif self.message.startswith("ENGAGED (") and self._kept_msg:
+            self.message = "ENGAGED"                 # the keeper's problem is solved
+        self._kept_msg = bool(k.problem)
+        return cmd, k.failure
+
     def disengage(self, reason: str, fault: bool) -> None:
         ctl = self.s.controls
         if self._ind_on:                            # switch AutoHaul's indicator off while controls are live
@@ -217,10 +314,14 @@ class Driver:
                     ctl.commit()
                     self.s.reader.wait_frame(30)
             self._ind_on = None
+        if self._kept_hold:
+            ctl.hold(self._kept_hold, False)
+            self._kept_hold = None
         ctl.neutral()
         ctl.set_enabled(False)
         ctl.commit()
         self.engaged = False
+        self._unfocused_at = None
         self.last_cmd = Command()
         self.message = f"handed back: {reason}"
         if fault:
@@ -257,34 +358,74 @@ class Driver:
             if self._last_sim_us is not None and f.simulation_time_us > self._last_sim_us:
                 dt = min(0.1, max(0.001, (f.simulation_time_us - self._last_sim_us) / 1e6))
             self._last_sim_us = f.simulation_time_us
+            events = s.reader.poll_events()
+            for ev in events:
+                if ev.id == "player.tollgate.paid":
+                    self.ap.toll_paid()
+                    self.note(event="toll_paid", **ev.attrs)
+            cfgb = s.reader.read_config() if self.md is not None else None
+            if self.md is not None and not self.engaged:
+                self.md.m.update(f, cfgb, events)        # the job, its events and the rates, while you drive
             if toggle:
                 if self.engaged:
                     self.disengage(f"{VK_NAME.get(self.engage_vk, 'engage')} pressed", fault=False)
                 else:
                     self.try_engage(f)
             st = None
+            if not self.engaged:
+                self.refocus_after_handback(now)
             if self.engaged:
                 traffic = self.gd.traffic() if self.longitudinal else None
-                cmd, st = self.ap.step(f, traffic, dt)
+                out = None
+                if self.md is not None:
+                    out = self.md.step(f, cfgb, events, traffic, dt)
+                    cmd, st = out.cmd, out.status
+                    self.mission_status = out.mission
+                    if out.fault:
+                        st.fault = out.fault
+                else:
+                    cmd, st = self.ap.step(f, traffic, dt)
                 verdict = s.safety.check(f, self.last_cmd)
                 if not verdict.ok and verdict.kind != "stale":
                     self.disengage(verdict.reason, fault=verdict.kind not in ("override", "kill", "paused"))
                 elif st.fault:
-                    self.disengage(st.fault, fault=True)
-                elif foreground_pid() != s.reader.header().game_pid:
-                    self.disengage("the game window lost focus", fault=True)
+                    self.disengage(st.fault, fault=not st.fault.startswith("at the"))
+                elif not self.keep_focus(now):
+                    self.disengage("the game window lost focus and AutoHaul couldn't bring it back", fault=True)
+                    self._refocus_until = now + 10.0       # until the game takes the released controls
+                elif (ready := self.keep_truck_ready(f, cmd, dt, now))[1]:
+                    self.disengage(ready[1], fault=True)
                 else:
+                    cmd = ready[0]
+                    self.ap.sent(cmd)
                     ctl = s.controls
                     ctl.steer(cmd.steer if self.lateral else 0.0)
                     ctl.throttle(cmd.throttle if self.longitudinal else 0.0)
                     ctl.brake(cmd.brake if self.longitudinal else 0.0)
                     self.indicate(f, st.indicator, now)
+                    if self.headlights is not None:
+                        button = self.headlights.step(f.game_time, bool(f.light_low_beam), bool(f.light_parking), now)
+                        if button:
+                            ctl.press(button)
+                    for name in st.press:                # paying at a toll gate
+                        ctl.press(name)
+                        self.note(event="press", button=name, reason=st.junction)
+                    if out is not None:                  # a stop script's buttons (refuel, sleep)
+                        for name in out.press:
+                            ctl.press(name)
+                        for name, on in out.hold.items():
+                            ctl.hold(name, on)
                     ctl.commit()
                     self.last_cmd = Command(cmd.steer if self.lateral else 0.0,
                                             cmd.throttle if self.longitudinal else 0.0,
                                             cmd.brake if self.longitudinal else 0.0)
                     self.stats["engaged_s"] += dt
                     self.stats["engaged_km"] += max(f.speed, 0.0) * dt / 1000
+                lights = getattr(self.ap.gw, "lights", None) if self.ap.gw is not None else None
+                for ch in getattr(lights, "changes", ())[:]:
+                    self.note(event="light", **ch)
+                if lights is not None and hasattr(lights, "changes"):
+                    lights.changes.clear()
                 if now - self._last_note > 0.1:
                     self._last_note = now
                     self.note(event="ap", **self.note_fields(st))
@@ -325,10 +466,16 @@ class Driver:
                 parts.append(f"target {st.target_kmh:3.0f} ({st.target_reason}){lead} thr {st.throttle:.2f} brk {st.brake:.2f}")
             if st.lane_change:
                 parts.append(f"lane change {st.lane_change}")
+            if st.junction:
+                parts.append(f"junction: {st.junction}")
             if st.route_km is not None:
                 parts.append(f"route {st.route_km:.2f} km{' ' + st.route_note if st.route_note else ''}"
                              f"{'' if st.on_route else ' (off route)'}")
-        print("\r" + " | ".join(parts)[:200].ljust(200), end="", flush=True)
+        if self.md is not None:
+            ms = self.mission_status if self.engaged and self.mission_status else self.md.m.status()
+            parts.append(f"mission: {ms.state}" + (f", next: {ms.next_stop}" if ms.next_stop else "")
+                         + (f" ({ms.action})" if ms.action else ""))
+        print("\r" + " | ".join(parts)[:240].ljust(240), end="", flush=True)
 
 
 def main() -> int:
@@ -340,6 +487,10 @@ def main() -> int:
     parser.add_argument("--to", help="destination: CITY, CITY:COMPANY or X,Y (default: the active job's depot)")
     parser.add_argument("--fallback-to", help="destination when no job is active at engage time")
     parser.add_argument("--no-route", action="store_true", help="lane following only (Phase 2 behaviour)")
+    parser.add_argument("--no-rules", action="store_true",
+                        help="hand back before every intersection instead of giving way by the map's rules")
+    parser.add_argument("--mission", action="store_true",
+                        help="Phase 4: run the active job (fuel and rest stops, decisions to logs/decisions.jsonl)")
     args = parser.parse_args()
     lateral = args.mode in ("steer", "full")
     longitudinal = args.mode in ("speed", "full")
@@ -363,7 +514,10 @@ def main() -> int:
         sp = speed_params(cfg)
         if args.max_kmh:
             sp.max_speed_kmh = args.max_kmh
-        router = junctions = target = fallback = places = None
+        router = junctions = rules = target = fallback = places = world = None
+        if args.mission and (args.no_route or args.mode != "full"):
+            print("--mission needs routing and --mode full")
+            return 1
         if not args.no_route:
             places = Places(map_dir(cfg))
             target = places.resolve(args.to) if args.to else None
@@ -372,18 +526,46 @@ def main() -> int:
                 if spec and got is None:
                     print(f"unknown destination {spec!r} (use CITY, CITY:COMPANY or X,Y with the game's tokens)")
                     return 1
-            router = Router(lm, LaneGraph.load_or_build(lm, map_dir(cfg)))
-            junctions = Junctions(lm)
+            world = load_world(map_dir(cfg), lm, rules=not args.no_rules)
+            router, junctions, rules = world.router, world.junctions, world.rules
         ap = Autopilot(lm, geom, mode, lateral=lateral, longitudinal=longitudinal, speed_params=sp,
                        relative_gain=consts.get("c_rsteersens", 0.42),
                        relative_deadzone=d.get("relative_deadzone", 0.0), hazards=toll_plazas(map_dir(cfg)),
-                       router=router, junctions=junctions)
+                       router=router, junctions=junctions, rules=rules, give_way=give_way_params(cfg))
+        if rules is not None and d.get("traffic_lights", True):
+            screen, cam_reader = GameScreen(s.reader.header().game_pid), GameDataReader()
+
+            def camera():
+                c, client = cam_reader.camera(), screen.client()
+                return Camera.from_block(c, client[2], client[3], vertical_fov=False) if c and client else None
+
+            ap.set_lights(LightVision(rules, lm, screen.grab, camera, time.monotonic))
+            print("traffic lights: read from the screen (stop on red and amber, go on green)")
+        if rules is not None and d.get("tolls", True):
+            ap.set_tolls(True)
+            print("toll gates: stops at the booth and pays (activate)")
         if router is not None:
             print("destination: " + (target.label if target else "the active job's depot when you engage"
                                      + (f", else {fallback.label}" if fallback else " (none: lane following)")))
+        md = None
+        if args.mission:
+            services = Services(lm, map_dir(cfg), no_go=rules.cars_only() if rules is not None else None)
+            mp, pp, ep, actp = mission_settings(cfg)
+            decisions = DecisionLog(logs_dir(cfg) / "decisions.jsonl")
+            mission = Mission(world, services, decisions, JobHistory(logs_dir(cfg) / "jobs.jsonl"), mp, ep, pp, actp)
+            g_fatigue = profile_setting(cfg, "g_fatigue")
+            mission.profile_fatigue = None if g_fatigue is None else g_fatigue.strip() not in ("0", "")
+            md = MissionDriver(ap, mission)
+            if target is not None:
+                mission.set_free_target(target)         # driven to while no job is active
+            mission.update(s.reader.read_latest(), s.reader.read_config(), [])
+            job = mission.status().job or "no job yet (accept one; AutoHaul picks it up)"
+            fat = {None: "unknown (watching the rest timer)", True: "on", False: "off (no sleep stops)"}
+            print(f"mission: {job}; fatigue {fat[mission.profile_fatigue]}; economics: {mission.econ_note}; "
+                  f"decisions -> {decisions.path}")
         s.safety.set_axes(steering=lateral, pedals=longitudinal)
         s.safety.reset()
-        drv = Driver(s, ap, lateral, longitudinal, places, target, fallback)
+        drv = Driver(s, ap, lateral, longitudinal, places, target, fallback, mission=md)
         s.recorder and s.recorder.note(event="start", mode=args.mode, steering_mode=mode,
                                        geometry=dataclasses.asdict(geom), speed=dataclasses.asdict(sp))
         print(f"truck {text(cfgb.truck.brand)} {text(cfgb.truck.name)}: wheelbase {geom.wheelbase:.2f} m; "

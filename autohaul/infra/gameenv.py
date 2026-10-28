@@ -74,6 +74,21 @@ def active_controls_file(cfg: Config) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
+def profile_setting(cfg: Config, name: str) -> str | None:
+    """A `uset` value from the most recently used profile's config_local.cfg or config.cfg (e.g. g_fatigue)."""
+    controls = active_controls_file(cfg)
+    if controls is None:
+        return None
+    for name_cfg in ("config_local.cfg", "config.cfg"):
+        path = controls.parent / name_cfg
+        if path.exists():
+            m = re.search(rf'^\s*uset\s+{re.escape(name)}\s+"([^"]*)"',
+                          path.read_text(encoding="utf-8", errors="replace"), re.MULTILINE)
+            if m:
+                return m.group(1)
+    return None
+
+
 def controls_constants(path: Path) -> dict[str, float]:
     text = path.read_text(encoding="utf-8", errors="replace")
     return {m.group(1): float(m.group(2)) for m in re.finditer(r'"constant (\w+) ([-\d.]+)"', text)}

@@ -84,10 +84,12 @@ def main() -> int:
             counts[f.name] = len(json.loads(f.read_text(encoding="utf-8")))
         except (ValueError, TypeError):
             counts[f.name] = "unreadable"
+    pin = json.loads((src / ".autohaul_pin.json").read_text())
     report = {
         "game_dir": str(game_dir),
         "expected_version": cfg.get("game.expected_version"),
-        "parser_commit": json.loads((src / ".autohaul_pin.json").read_text())["commit"],
+        "parser_commit": pin["commit"],
+        "parser_patches": pin["patches"],
         "dry_run": args.dry_run,
         "only_defs": args.only_defs,
         "exit_code": code,

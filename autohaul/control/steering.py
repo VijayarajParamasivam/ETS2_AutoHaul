@@ -123,7 +123,7 @@ class AbsoluteServo:
 class LateralParams:
     omega_max: float = 0.6          # rad/s, natural frequency of the lateral-error response at speed
     zeta: float = 0.9
-    d_min: float = 12.0             # m: at low speed omega = v / d_min (converge within ~a truck length)
+    d_min: float = 7.0             # m: at low speed omega = v / d_min (converge within ~a truck length)
     predict_s: float = 0.25         # s: control the predicted pose (covers servo + game latency)
     ff_preview_s: float = 0.15      # s: curvature feedforward looks this far ahead of the rear axle
     ki: float = 0.04                # 1/s: integral on lateral error (removes offsets in long curves)
@@ -131,10 +131,13 @@ class LateralParams:
     max_corr_lat_acc: float = 1.0   # m/s^2: cap on the correction's lateral acceleration
     max_corr_kappa: float = 0.06    # 1/m: and on its curvature
     # The truck turns less than the kinematic model says at speed (tyre slip). Learn the ratio
-    # measured curvature (yaw rate / speed) : kinematic curvature (wheel angle) and steer by it.
+    # measured curvature (yaw rate / speed) : kinematic curvature (wheel angle) and steer by it. Slip grows
+    # with speed squared (ratio = 1 / (1 + c v^2)), so what is learned is c: a ratio learned on the open
+    # road would make the truck oversteer in a slow town turn, where it follows the kinematic model.
     adapt_tau_s: float = 2.0
-    ratio_min: float = 0.5
+    ratio_min: float = 0.5          # bounds on the ratio at `ratio_ref_v`
     ratio_max: float = 1.3
+    ratio_ref_v: float = 25.0       # m/s
     # Relative steering turns the wheel at a limited rate (0.42 units/s at full axis): look ahead and
     # start turning early enough that the wheel can follow the curvature of the next seconds.
     preview_horizon_s: float = 3.0
@@ -158,20 +161,26 @@ class LateralController:
         self.geom = geom
         self.p = params or LateralParams()
         self.y_int = 0.0
-        self.ratio = 1.0
+        self.c_us = 0.0             # learned understeer: ratio(v) = 1 / (1 + c_us v^2)
+        self.ratio = 1.0            # ratio at the current speed
 
     def reset(self) -> None:
         self.y_int = 0.0      # keep the learned ratio: it belongs to the truck, not to the engagement
 
+    def ratio_at(self, v: float) -> float:
+        return 1.0 / (1.0 + self.c_us * v * v)
+
     def learn(self, pose: Pose, steer_left: float, dt: float) -> None:
-        """Update the curvature-response ratio from the measured yaw rate and wheel angle."""
+        """Update the understeer coefficient from the measured yaw rate and wheel angle."""
         v = pose.speed
         k_kin = -math.tan(steer_left) / self.geom.wheelbase
         if v > 8.0 and abs(k_kin) > 2e-4:
             inst = (pose.yaw_rate / v) / k_kin
             if 0.2 < inst < 2.0:
                 a = min(1.0, dt / self.p.adapt_tau_s) * min(1.0, abs(k_kin) / 1e-3)
-                self.ratio = _clamp(self.ratio + a * (inst - self.ratio), self.p.ratio_min, self.p.ratio_max)
+                vr2 = self.p.ratio_ref_v ** 2
+                self.c_us = _clamp(self.c_us + a * ((1.0 / inst - 1.0) / (v * v) - self.c_us),
+                                   (1.0 / self.p.ratio_max - 1.0) / vr2, (1.0 / self.p.ratio_min - 1.0) / vr2)
 
     def step(self, pose: Pose, path: PathRef, dt: float, steer_measured: float | None = None,
              steer_rate: float | None = None, offset=None) -> LateralOut:
@@ -182,6 +191,7 @@ class LateralController:
         if steer_measured is not None:
             self.learn(pose, steer_measured, dt)
         v = max(abs(pose.speed), 0.5)
+        self.ratio = self.ratio_at(v)
         # predicted pose after the loop latency (constant speed and yaw rate)
         tau = p.predict_s
         r_mid = pose.rotation + pose.yaw_rate * tau / 2
@@ -211,11 +221,14 @@ class LateralController:
         steer = curvature_to_left(kappa / self.ratio, g.wheelbase)
         limited = False
         if steer_rate:
-            # the wheel must be within rate x tau of the feedforward angle needed tau seconds from now
+            # the wheel must be within rate x tau of the angle needed tau seconds from now: that point's
+            # feedforward plus today's correction (the correction isn't the preview's to undo; at low speed
+            # in a junction S-bend that pinned the wheel to the next curve and the truck drifted off)
             r = steer_rate * p.rate_margin
             taus = np.arange(0.2, p.preview_horizon_s + 1e-9, 0.2)
             k_f = np.asarray(path.curvature(pr.s + v * taus))
-            d_f = -np.arctan(k_f / self.ratio * g.wheelbase)
+            d_f = -np.arctan(k_f / self.ratio * g.wheelbase) + (steer - curvature_to_left(kappa_ff / self.ratio,
+                                                                                           g.wheelbase))
             lo, hi = float(np.max(d_f - r * taus)), float(np.min(d_f + r * taus))
             if lo <= hi:
                 steer = _clamp(steer, lo, hi)

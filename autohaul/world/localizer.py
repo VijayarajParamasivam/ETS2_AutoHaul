@@ -32,10 +32,14 @@ class LaneTracker:
         self.max_lateral = max_lateral
         self.hysteresis = hysteresis_m
         self.state: LaneState | None = None
+        self.prev_lane: int | None = None    # the lane the tracked one continues (None after a jump)
         self.path_lanes: list[int] = []      # lanes covered by the last path_ahead() call, in order
+        self.path_back = 0.0                 # metres of that path behind the truck's projection
+        self.bias = 0.0                      # where the truck is meant to be relative to the lane centre (+ right)
 
     def reset(self) -> None:
         self.state = None
+        self.prev_lane = None
 
     def update(self, x: float, y: float, rotation: float, prefer: list[int] | None = None,
                force: int | None = None, force_max_dist: float = 7.5) -> LaneState | None:
@@ -46,6 +50,9 @@ class LaneTracker:
             for h in self.lm.nearest(x, y, rotation, max_dist=force_max_dist, k=8):
                 if h.lane == force:
                     switched = self.state is not None and self.state.lane != h.lane
+                    if switched:
+                        cont = h.lane in {lane for lane, _ in self.lm.successors(self.state.lane)}
+                        self.prev_lane = self.state.lane if cont else None
                     # the lane is known (a deliberate change), so being between two lanes is not ambiguity;
                     # the autopilot checks the truck against the eased line instead
                     self.state = LaneState(h.lane, h.segment, h.t, h.lateral, h.heading_err, 0.9, switched)
@@ -55,40 +62,51 @@ class LaneTracker:
             self.state = None
             return None
         best = hits[0]
-        chosen, switched = best, True
+        chosen, switched, known = best, True, False
         if self.state is not None:
             keep = {self.state.lane} | {lane for lane, _ in self.lm.successors(self.state.lane)}
             planned = set(prefer or ()) & keep
             ranked = [h for h in hits if h.lane in planned] + [h for h in hits if h.lane in keep]
             for h in ranked:
                 if h.dist <= best.dist + self.hysteresis:
-                    chosen, switched = h, False
+                    chosen, switched, known = h, False, h.lane in planned
                     break
-        conf = self._confidence(chosen, hits)
+        conf = self._confidence(chosen, hits, known, self.bias)
+        if self.state is None or switched:
+            self.prev_lane = None
+        elif chosen.lane != self.state.lane:
+            self.prev_lane = self.state.lane
         self.state = LaneState(chosen.lane, chosen.segment, chosen.t, chosen.lateral, chosen.heading_err, conf,
                                switched and self.state is not None)
         return self.state
 
     @staticmethod
-    def _confidence(h: LaneHit, hits: list[LaneHit]) -> float:
-        c = max(0.0, 1.0 - abs(h.lateral) / 3.0) * max(0.0, 1.0 - abs(h.heading_err) / math.radians(35))
+    def _confidence(h: LaneHit, hits: list[LaneHit], known: bool = False, bias: float = 0.0) -> float:
+        """`known`: the lane continues the tracked one along the planned path, so other lanes close by (the
+        overlapping curves of a junction) don't make it ambiguous."""
+        c = max(0.0, 1.0 - abs(h.lateral - bias) / 3.0) * max(0.0, 1.0 - abs(h.heading_err) / math.radians(35))
         others = [o.dist for o in hits if o.lane != h.lane]
-        if others and others[0] - h.dist < 0.5:      # two lanes almost equally close: ambiguous
+        if others and others[0] - h.dist < 0.5 and not known:      # two lanes almost equally close: ambiguous
             c *= 0.6
         return c
 
-    def path_ahead(self, distance: float, choose=None) -> np.ndarray:
+    def path_ahead(self, distance: float, choose=None, behind: float = 0.0) -> np.ndarray:
         """Polyline (n, 2) from the truck's projection on its lane, `distance` metres forward.
 
         `choose(lane, successors)` picks the next lane at a split; default: the straightest.
+        `behind`: also this many metres before the projection (the lane's, then the previous lane's), so the
+        rear axle is measured against the real lane, not a straight extension of the path's first segment;
+        `path_back` says how much was added (arc lengths on the path include it).
         """
         self.path_lanes = []
+        self.path_back = 0.0
         if self.state is None:
             return np.empty((0, 2))
         lm, st = self.lm, self.state
         seg = lm.seg[st.segment]
         start = seg[0:2] + st.t * (seg[2:4] - seg[0:2])
-        pts = [start]
+        back = self._behind(start, behind) if behind > 0 else []
+        pts = back + [start]
         acc = 0.0
         lane, s = st.lane, st.segment
         last = lm.lane_last[lane]
@@ -117,3 +135,27 @@ class LaneTracker:
                 pts.append(first)
                 prev = first
         return np.array(pts)
+
+    def _behind(self, start: np.ndarray, behind: float) -> list[np.ndarray]:
+        """Points from `behind` metres back along the tracked lane (and the previous one) up to `start`."""
+        lm, st = self.lm, self.state
+        out, prev, acc = [], start, 0.0
+        lane, s = st.lane, st.segment
+        while acc < behind:
+            p = lm.seg[s, 0:2]
+            d = float(np.hypot(*(p - prev)))
+            if d > 1e-6:
+                out.append(p)
+                acc += d
+                prev = p
+            if s > lm.lane_first[lane]:
+                s -= 1
+                continue
+            pl = self.prev_lane
+            if lane == st.lane and pl is not None and np.hypot(*(lm.seg[lm.lane_last[pl], 2:4] - p)) < 1.5:
+                lane, s = pl, lm.lane_last[pl]
+                continue
+            break
+        self.path_back = acc
+        out.reverse()
+        return out

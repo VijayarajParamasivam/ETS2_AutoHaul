@@ -177,3 +177,48 @@ def test_calibrate_looks_from_prefab_connections():
     fwd, bwd, source = out["odd"]
     assert source == "prefab evidence" and fwd == pytest.approx([3.25]) and bwd == pytest.approx([-3.25])
     assert out["plain"] == ([2.25], [-2.25], "rule")
+
+
+def test_snap_offsets_trusts_the_junction_even_against_the_layout():
+    from autohaul.world.lanemap import snap_offsets
+    mirrored = [-13.25, -8.75, -4.25]                      # "Highway 3 lanes 2m offset": majority vote said left
+    obs = np.array([4.25, 4.3, 8.75, 13.25])               # two curves start from the first lane
+    assert snap_offsets(obs, mirrored) == pytest.approx([4.275, 8.75, 13.25])
+    assert snap_offsets(np.array([-4.25, -8.75]), [-4.25, -8.75]) == pytest.approx([-4.25, -8.75])   # innermost first
+    assert snap_offsets(np.array([2.0, 4.3, 8.7, 20.0]), [4.25, 8.75]) == pytest.approx([4.3, 8.7])   # extra lanes
+    assert snap_offsets(np.array([4.3]), [4.25, 8.75]) is None                                         # too few
+
+
+def test_lane_offsets_blend_small_corrections_and_replace_wrong_layouts():
+    from autohaul.world.lanemap import lane_offsets
+    frac = np.linspace(0, 1, 101)[:, None]
+    small = lane_offsets(7.25, 4.25, None, True, False, frac, 200.0).ravel()   # lanes move in 3 m at the junction
+    assert small[0] == pytest.approx(4.25) and small[20] == pytest.approx(7.25) and small[-1] == pytest.approx(7.25)
+    wrong = lane_offsets(-13.25, 4.25, 4.25, True, False, frac, 200.0).ravel()  # layout on the wrong side
+    assert np.allclose(wrong, 4.25)
+    carried = lane_offsets(7.25, 4.25, None, False, False, frac, 200.0).ravel()  # small and only carried: layout
+    assert np.allclose(carried, 7.25)
+
+
+def test_router_counts_city_metres_like_the_game():
+    """From A to B: 600 m of open road (19 game m per m: 11,400) or ~940 m through a city area (3 per m: ~2,800).
+    The game's GPS takes the city; with city weights so does AutoHaul, without them the open road."""
+    from autohaul.sim.course import arc_polyline
+    from autohaul.world.graph import LaneGraph
+    from autohaul.world.lanemap import hermite
+    from autohaul.world.route import Router
+    from tests.test_route import build
+    start = arc_polyline([(100, 0.0)])
+    straight = arc_polyline([(600, 0.0)], x=100, y=0)
+    up = np.array(hermite((100.0, 0.0), (400.0, 300.0), 0.0, 0.0, 60))
+    down = np.array(hermite((400.0, 300.0), (700.0, 0.0), 0.0, 0.0, 60))
+    end = arc_polyline([(100, 0.0)], x=700, y=0)
+    lm = build([(start, KIND_ROAD, 1, 1), (straight, KIND_ROAD, 2, 1), (up, KIND_ROAD, 3, 1), (down, KIND_ROAD, 4, 1),
+                (end, KIND_ROAD, 5, 1)])
+    g = LaneGraph.build(lm, log=lambda *_: None)
+    plain = Router(lm, g).route(0, 0.0, (790.0, 0.0))
+    w = np.ones(len(g.length))
+    w[[2, 3]] = 3 / 19
+    city = Router(lm, g, weight=w).route(0, 0.0, (790.0, 0.0))
+    assert 1 in plain.lanes and 2 not in plain.lanes
+    assert 2 in city.lanes and 3 in city.lanes and city.length_m > plain.length_m + 250   # lengths stay metres

@@ -67,9 +67,9 @@ class PathRef:
     def rotation_at(self, s: float) -> float:
         return float(np.interp(s, self._mid_s, self._mid_rot))
 
-    def curvature(self, s) -> np.ndarray | float:
-        """Curvature (1/m, + = right turn) averaged over the window centred at s."""
-        h = self._window / 2
+    def curvature(self, s, window: float | None = None) -> np.ndarray | float:
+        """Curvature (1/m, + = right turn) averaged over the window centred at s (default: the path's)."""
+        h = (window or self._window) / 2
         s = np.asarray(s, dtype=float)
         lo, hi = np.clip(s - h, 0, self.length), np.clip(s + h, 0, self.length)
         span = np.maximum(hi - lo, 1e-6)

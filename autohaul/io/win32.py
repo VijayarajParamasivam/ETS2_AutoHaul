@@ -139,3 +139,73 @@ def foreground_pid() -> int:
     pid = wt.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return int(pid.value)
+
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
+user32.IsWindowVisible.argtypes = [wt.HWND]
+user32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+user32.GetWindow.restype = wt.HWND
+user32.IsIconic.argtypes = [wt.HWND]
+user32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.BringWindowToTop.argtypes = [wt.HWND]
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+user32.SwitchToThisWindow.argtypes = [wt.HWND, wt.BOOL]
+user32.SwitchToThisWindow.restype = None
+user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
+user32.keybd_event.restype = None
+kernel32.GetCurrentThreadId.restype = wt.DWORD
+GW_OWNER = 4
+SW_RESTORE = 9
+VK_MENU = 0x12
+KEYEVENTF_KEYUP = 0x0002
+
+
+def main_window(pid: int) -> int:
+    """The visible top-level, unowned window of process `pid` (0 if none)."""
+    found = []
+
+    def visit(hwnd, _):
+        p = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(hwnd) and not user32.GetWindow(hwnd, GW_OWNER):
+            found.append(hwnd)
+            return False
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(visit), 0)
+    return found[0] if found else 0
+
+
+def bring_to_front(pid: int, alt_trick: bool = True) -> bool:
+    """Put process `pid`'s window back in front so it gets input again. Windows only lets a process take the
+    foreground in some cases, so this tries the usual ways in turn: plain SetForegroundWindow, joining the
+    foreground thread's input queue, SwitchToThisWindow, and (alt_trick) a tap of Alt, which lifts the lock.
+    True if the window is in front afterwards."""
+    hwnd = main_window(pid)
+    if not hwnd:
+        return False
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    if user32.SetForegroundWindow(hwnd) and foreground_pid() == pid:
+        return True
+    fg = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    me = kernel32.GetCurrentThreadId()
+    if fg_thread and fg_thread != me and user32.AttachThreadInput(me, fg_thread, True):
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            user32.AttachThreadInput(me, fg_thread, False)
+        if foreground_pid() == pid:
+            return True
+    user32.SwitchToThisWindow(hwnd, True)
+    if foreground_pid() == pid:
+        return True
+    if alt_trick:
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        user32.SetForegroundWindow(hwnd)
+    return foreground_pid() == pid
