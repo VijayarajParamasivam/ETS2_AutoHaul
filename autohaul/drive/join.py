@@ -38,7 +38,9 @@ def _curve(x, y, rot, px, py, prot):
 
 def plan_join(lm: LaneMap, router, x: float, y: float, rot: float, destination=None, goal=None,
               no_go=None, max_dist_m: float = 60.0, max_turn_deg: float = 100.0, min_radius_m: float = 9.0,
-              ahead_m: float = 150.0) -> Join | None:
+              ahead_m: float = 150.0, prefer=None) -> Join | None:
+    """`prefer(lane)`: lanes tried first, whatever the curve length: a company entrance's lanes (2026-10-29: in a
+    Paris yard the shortest curve led to the road behind the fence, and the truck headed for the fence)."""
     seen = set()
     cands = []
     for dx in (-40.0, 0.0, 40.0):
@@ -70,8 +72,12 @@ def plan_join(lm: LaneMap, router, x: float, y: float, rot: float, destination=N
                 best = (length, lane, float(d[i + 1]), pts)
         if best is not None:
             found.append(best)
-    found.sort(key=lambda f: f[0])
-    for length, lane, s, pts in found[:6]:
+    if prefer is not None and any(prefer(ln) for ln in cands) and not any(prefer(f[1]) for f in found):
+        # a company entrance is right here but not ahead: the way out is round the yard, which isn't mapped.
+        # Any other lane would be across the yard's fence (2026-10-29): don't guess
+        return None
+    found.sort(key=lambda f: (0 if prefer is not None and prefer(f[1]) else 1, f[0]))
+    for length, lane, s, pts in found[:8]:
         rt = None
         if destination is not None and router is not None:
             rt = router.route(lane, s, destination, goal=goal)

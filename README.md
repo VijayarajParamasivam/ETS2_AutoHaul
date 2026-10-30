@@ -43,3 +43,22 @@ py -3.12 -m venv .venv
 Requires Visual Studio Build Tools (C++ workload), Python 3.12, Node.js (map extraction only) and git.
 
 AutoHaul never supports TruckersMP or Convoy, and refuses to engage when it detects either one.
+
+## Run
+
+Double-click **`AutoHaul.bat`** (or a desktop shortcut to it). The launcher window offers these modes:
+
+| Mode | |
+|---|---|
+| Job (full mission) | runs the active job: to the trailer, couples it, to the destination, quick park; fuel and rest stops |
+| Drive to a place | follows the route to a `CITY` or `CITY:COMPANY` you type |
+| Follow the road | lane keeping and speed, no route |
+| Steer only / Speed only | AutoHaul does one axis, you do the other |
+
+Press **Start**, click the game, and press `/` to engage. Press `/` again (or any driving key) to take over. **Stop** hands the truck back and quits. The launcher runs `tools/drive.py` (`--mission`, `--to`, `--no-route`, `--mode`), which also works from a terminal.
+
+**Overlay** (`tools/overlay.py`, "Show overlay"): a see-through panel on the game showing what AutoHaul reads, what it's doing and why. Clicks go through it, it never takes the focus, and the traffic-light reader doesn't see it.
+
+**Learning** (`autohaul/learn`, "Learn while driving"): AutoHaul adjusts its curve speed, steering balance, correction strength, braking and pedal values to the truck, per truck state, in small steps inside hard bounds. It slows down at places where you've had to take over, corrects its routes where the game's GPS disagrees, and goes back to earlier values if drives get clearly worse. Every change and its reason is in `learned/learning.jsonl` under the cache folder; `tools/learn_replay.py --report` shows what it knows; "Reset learning" forgets it. See [docs/LEARNING.md](docs/LEARNING.md).
+
+**Wipers**: telemetry has no rain signal, so AutoHaul learns what rain looks like from the times you switch the wipers on yourself. It doesn't touch them until it has seen enough rain.

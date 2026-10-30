@@ -21,8 +21,10 @@ Everything is recorded (frames + autopilot notes) to <cache>/recordings/.
 
 from __future__ import annotations
 
+import _thread
 import argparse
 import dataclasses
+import json
 import math
 import sys
 import threading
@@ -35,10 +37,15 @@ from autohaul.control.giveway import GiveWayParams  # noqa: E402
 from autohaul.control.speed import SpeedParams  # noqa: E402
 from autohaul.control.vehicle import TruckGeometry  # noqa: E402
 from autohaul.drive.autopilot import Autopilot  # noqa: E402
+from autohaul.drive.indicators import IndicatorControl  # noqa: E402
 from autohaul.drive.keeper import Keeper, KeeperParams  # noqa: E402
+from autohaul.drive.wipers import WiperControl, picture_features  # noqa: E402
+from autohaul.infra.overlay_feed import OverlayFeed, explain  # noqa: E402
+from autohaul.learn.learner import Learner  # noqa: E402
 from autohaul.drive.lights import Headlights  # noqa: E402
 from autohaul.infra.gameenv import active_controls_file, controls_constants, profile_setting, steering_mode  # noqa: E402
-from autohaul.infra.paths import logs_dir, map_dir  # noqa: E402
+from autohaul.infra import saves  # noqa: E402
+from autohaul.infra.paths import cache_dir, logs_dir, map_dir  # noqa: E402
 from autohaul.infra.session import Session, enable_ansi  # noqa: E402
 from autohaul.io import _layout as L  # noqa: E402
 from autohaul.io.gamedata import GameDataReader  # noqa: E402
@@ -131,8 +138,8 @@ class Driver:
         self._kept_msg = False                   # the status message is the keeper's
         self.mission_status = None
         self.places, self.fixed_target, self.fallback = places, fixed_target, fallback
-        self._ind_on: str | None = None         # indicator AutoHaul switched on ("left"/"right")
-        self._ind_pressed = 0.0
+        self.ind = IndicatorControl(lambda name: self.s.controls.press(name))
+        self._adaptive_at = self._saved_at = time.monotonic()
         d = s.cfg.get("drive", {})
         self.beeps = d.get("beeps", True)
         self.require_traffic = d.get("require_traffic_data", True)
@@ -153,9 +160,88 @@ class Driver:
         self.stats = {"engagements": 0, "engaged_s": 0.0, "engaged_km": 0.0, "faults": {}}
 
     # ------------------------------------------------------------- engage / disengage
+    learner = feed = wipers = grab_view = None      # set in main()
+    _paused_at: tuple | None = None                 # paused while engaged: where the truck stood
+    slow_step_ms = 100.0
+    capacity_l = 0.0
+    _last_lane: int | None = None
+    FEED_EVENTS = {"engaged": "engaged", "keeper": "truck: ", "press": "pressed ", "toll_paid": "toll paid",
+                   "gps_reroute": "the game's GPS re-routed", "light": "light: ", "toll_booth_avoided": "avoiding a toll booth",
+                   "engage_refused": "can't engage: ", "paused": "game paused: still in charge"}
+
     def note(self, **fields) -> None:
         if self.s.recorder:
             self.s.recorder.note(**fields)
+        e = fields.get("event")
+        if self.feed is not None and e in self.FEED_EVENTS:
+            detail = fields.get("reason") or fields.get("action") or fields.get("button") or fields.get("colour") or ""
+            self.feed.event(f"{self.FEED_EVENTS[e]}{detail}")
+
+    def hold_paused(self, f, cfgb, events, now: float) -> None:
+        """The game is paused: nothing moves, and AutoHaul stays in charge. It used to hand back here, and after the
+        pause the truck rolled on at speed with nobody steering (2026-10-30: 4 s at 78 km/h, then the rail)."""
+        ctl = self.s.controls
+        if self._paused_at is None:
+            self._paused_at = (f.truck_placement.x, f.truck_placement.z)
+            self.note(event="paused", keeps_driving=True)
+            self.message = "ENGAGED (game paused: carries on when you resume; / or a driving key takes over)"
+        verdict = self.s.safety.check(f, None)
+        if not verdict.ok and verdict.kind not in ("paused", "override", "stale"):
+            self.disengage(verdict.reason, fault=verdict.kind != "kill")
+            return
+        if self.md is not None:
+            self.md.m.update(f, cfgb, events)
+        ctl.neutral()
+        ctl.commit()                                # the heartbeat
+        self.feed_overlay(f, None, now)
+        if now - self._last_status > self.status_period:
+            self._last_status = now
+            self.print_status(f, None)
+
+    def resume_after_pause(self, f) -> bool:
+        """The pause is over. Carry on, unless the truck was moved meanwhile (a save loaded, a ferry). Keys pressed in
+        the menus don't count as taking over; a driving key still down does."""
+        x, y = self._paused_at
+        self._paused_at = None
+        if math.hypot(f.truck_placement.x - x, f.truck_placement.z - y) > 30.0:
+            self.disengage("the truck was moved while the game was paused", fault=False)
+            return False
+        self.s.safety.reset()
+        self.ap.servo.reset()
+        self.last_cmd = Command()
+        self.message = "ENGAGED"
+        self.note(event="resumed")
+        if self.feed is not None:
+            self.feed.event("game resumed: still driving")
+        return True
+
+    def adaptive(self, f, st, now: float, dt: float) -> None:
+        """Once a second: the wipers, and saving what's been learned now and then."""
+        if now - self._adaptive_at < 1.0:
+            return
+        step, self._adaptive_at = now - self._adaptive_at, now
+        if self.wipers is not None and self.grab_view is not None:
+            img = self.grab_view() if foreground_pid() == self.s.reader.header().game_pid and not f.paused else None
+            self.wipers.step(bool(f.wipers), None if img is None else picture_features(img), now, min(step, 2.0), self.engaged)
+        if now - self._saved_at > 300.0:
+            self._saved_at = now
+            if self.learner is not None:
+                self.learner.save()
+            if self.wipers is not None:
+                self.wipers.save()
+
+    def feed_overlay(self, f, st, now: float) -> None:
+        if self.feed is None or not self.feed.due(now):
+            return
+        ms = None
+        if self.md is not None:
+            ms = self.mission_status if self.engaged and self.mission_status else self.md.m.status()
+        extras: dict = {}
+        if self.wipers is not None:
+            extras["rain"] = self.wipers.describe()
+        if self.learner is not None:
+            extras["learned"] = self.learner.summary()
+        self.feed.send(explain(f, st if self.engaged else None, ms, self.message, self.engaged, self.capacity_l, extras))
 
     def try_engage(self, frame) -> None:
         s, ctl = self.s, self.s.controls
@@ -201,6 +287,7 @@ class Driver:
         self.engaged = True
         if self.keeper is not None:
             self.keeper.reset()
+        self.ind.reset()
         self.last_cmd = Command()
         self.stats["engagements"] += 1
         self.message = "ENGAGED"
@@ -221,28 +308,6 @@ class Driver:
             self.ap.set_destination(target.x, target.y)
             self.note(event="destination", label=target.label, x=target.x, y=target.y)
             print(f"\ndestination: {target.label}")
-
-    def indicate(self, f, want: str | None, now: float) -> None:
-        """Match the game's indicator to what the autopilot wants. The game's buttons are toggles, so compare
-        with telemetry and press only on a mismatch (at most every 0.6 s, so a press is seen before the next).
-        Only an indicator AutoHaul switched on is switched off again."""
-        if now - self._ind_pressed < 0.6:
-            return
-        state = {"left": bool(f.lblinker), "right": bool(f.rblinker)}
-        for side in ("left", "right"):
-            on = state[side]
-            if want == side and not on:
-                self.s.controls.press(f"{side[0]}blinker")
-                self._ind_on, self._ind_pressed = side, now
-                return
-            if want != side and on and self._ind_on == side:
-                self.s.controls.press(f"{side[0]}blinker")
-                self._ind_pressed = now
-                if not want:
-                    self._ind_on = None
-                return
-        if want is None and self._ind_on and not state[self._ind_on]:
-            self._ind_on = None
 
     def keep_focus(self, now: float) -> bool:
         """Engaged: True while the game window is in front, or was brought back within the grace time. The game
@@ -277,12 +342,12 @@ class Driver:
         self._refocus_tried = now
         bring_to_front(game)
 
-    def keep_truck_ready(self, f, cmd, dt: float, now: float):
+    def keep_truck_ready(self, f, cmd, dt: float, now: float, reversing: bool = False):
         """Engine on, parking brake off, gearbox in drive (autohaul/drive/keeper.py). Returns the command to send
         (held on the brake while something isn't ready) and a failure to hand back with, or None."""
         if self.keeper is None:
             return cmd, None
-        k = self.keeper.step(f, cmd.throttle > 0.2, dt, now)
+        k = self.keeper.step(f, cmd.throttle > 0.2, dt, now, reversing)
         ctl = self.s.controls
         if k.press:
             ctl.press(k.press)
@@ -304,16 +369,30 @@ class Driver:
 
     def disengage(self, reason: str, fault: bool) -> None:
         ctl = self.s.controls
-        if self._ind_on:                            # switch AutoHaul's indicator off while controls are live
+        if self.learner is not None:
             f = self.s.reader.read_latest()
-            if f is not None and ((self._ind_on == "left" and f.lblinker) or (self._ind_on == "right" and f.rblinker)):
-                ctl.neutral()
-                ctl.press(f"{self._ind_on[0]}blinker")
+            self.learner.on_handback(reason, float(f.speed) if f is not None else 0.0, self._last_lane)
+        if self.feed is not None:
+            self.feed.event(f"handed back: {reason}")
+        failed = getattr(self.ap.gw, "failed_toll_lane", None) if self.ap.gw is not None else None
+        if reason.startswith("toll gate: no payment") and failed is not None:
+            remember_bad_toll(self.s.cfg, self.ap.lm, failed)    # the router avoids this booth from now on
+            self.note(event="toll_booth_avoided", lane=self.ap.lm.describe(failed))
+        if self.ind.mine:                           # switch AutoHaul's indicator off while controls are live
+            side = self.ind.mine
+            ctl.neutral()
+            end = time.monotonic() + self.ind.settle_s(time.monotonic())
+            while time.monotonic() < end:           # a press just sent must show in telemetry first
+                ctl.commit()
+                self.s.reader.wait_frame(30)
+            f = self.s.reader.read_latest()
+            if f is not None and ((side == "left" and f.lblinker) or (side == "right" and f.rblinker)):
+                ctl.press(f"{side[0]}blinker")
                 end = time.monotonic() + 0.15
                 while time.monotonic() < end:
                     ctl.commit()
                     self.s.reader.wait_frame(30)
-            self._ind_on = None
+            self.ind.reset()
         if self._kept_hold:
             ctl.hold(self._kept_hold, False)
             self._kept_hold = None
@@ -363,6 +442,12 @@ class Driver:
                 if ev.id == "player.tollgate.paid":
                     self.ap.toll_paid()
                     self.note(event="toll_paid", **ev.attrs)
+                elif ev.id == "player.fined":
+                    offence = ev.attrs.get("fine.offence", "?")
+                    if self.learner is not None:
+                        self.learner.on_fine(offence, float(f.speed), self._last_lane)
+                    if self.feed is not None:
+                        self.feed.event(f"fined: {offence} ({ev.attrs.get('fine.amount', '?')} EUR)")
             cfgb = s.reader.read_config() if self.md is not None else None
             if self.md is not None and not self.engaged:
                 self.md.m.update(f, cfgb, events)        # the job, its events and the rates, while you drive
@@ -373,10 +458,17 @@ class Driver:
                     self.try_engage(f)
             st = None
             if not self.engaged:
+                self._paused_at = None
                 self.refocus_after_handback(now)
+            if self.engaged and f.paused:
+                self.hold_paused(f, cfgb, events, now)
+                continue
+            if self.engaged and self._paused_at is not None and not self.resume_after_pause(f):
+                continue
             if self.engaged:
                 traffic = self.gd.traffic() if self.longitudinal else None
                 out = None
+                step_at = time.perf_counter()
                 if self.md is not None:
                     out = self.md.step(f, cfgb, events, traffic, dt)
                     cmd, st = out.cmd, out.status
@@ -385,6 +477,11 @@ class Driver:
                         st.fault = out.fault
                 else:
                     cmd, st = self.ap.step(f, traffic, dt)
+                took_ms = (time.perf_counter() - step_at) * 1e3
+                if took_ms > self.slow_step_ms:                # the truck drives on blind during this: never expected
+                    self.note(event="slow_step", ms=round(took_ms), timings=st.timings_ms, lane=st.lane)
+                    if self.feed is not None:
+                        self.feed.event(f"slow step: {took_ms:.0f} ms")
                 verdict = s.safety.check(f, self.last_cmd)
                 if not verdict.ok and verdict.kind != "stale":
                     self.disengage(verdict.reason, fault=verdict.kind not in ("override", "kill", "paused"))
@@ -393,7 +490,7 @@ class Driver:
                 elif not self.keep_focus(now):
                     self.disengage("the game window lost focus and AutoHaul couldn't bring it back", fault=True)
                     self._refocus_until = now + 10.0       # until the game takes the released controls
-                elif (ready := self.keep_truck_ready(f, cmd, dt, now))[1]:
+                elif (ready := self.keep_truck_ready(f, cmd, dt, now, bool(out and out.reverse)))[1]:
                     self.disengage(ready[1], fault=True)
                 else:
                     cmd = ready[0]
@@ -402,7 +499,7 @@ class Driver:
                     ctl.steer(cmd.steer if self.lateral else 0.0)
                     ctl.throttle(cmd.throttle if self.longitudinal else 0.0)
                     ctl.brake(cmd.brake if self.longitudinal else 0.0)
-                    self.indicate(f, st.indicator, now)
+                    self.ind.step(f.lblinker, f.rblinker, st.indicator, now)
                     if self.headlights is not None:
                         button = self.headlights.step(f.game_time, bool(f.light_low_beam), bool(f.light_parking), now)
                         if button:
@@ -410,9 +507,10 @@ class Driver:
                     for name in st.press:                # paying at a toll gate
                         ctl.press(name)
                         self.note(event="press", button=name, reason=st.junction)
-                    if out is not None:                  # a stop script's buttons (refuel, sleep)
+                    if out is not None:                  # a stop script's buttons (refuel, sleep, quick park)
                         for name in out.press:
                             ctl.press(name)
+                            self.note(event="press", button=name, reason=out.mission.action)
                         for name, on in out.hold.items():
                             ctl.hold(name, on)
                     ctl.commit()
@@ -428,7 +526,15 @@ class Driver:
                     lights.changes.clear()
                 if now - self._last_note > 0.1:
                     self._last_note = now
-                    self.note(event="ap", **self.note_fields(st))
+                    fields = self.note_fields(st)
+                    self.note(event="ap", **fields)
+                    if self.learner is not None and self.engaged:
+                        trailers = getattr(f, "trailers", None)
+                        self.learner.observe(time.time(), f, fields, True, bool(trailers and trailers[0].connected))
+                if st.lane is not None:
+                    self._last_lane = st.lane
+            self.adaptive(f, st, now, dt)
+            self.feed_overlay(f, st, now)
             if now - self._last_status > self.status_period:
                 self._last_status = now
                 self.print_status(f, st)
@@ -478,6 +584,27 @@ class Driver:
         print("\r" + " | ".join(parts)[:240].ljust(240), end="", flush=True)
 
 
+BAD_TOLLS = "toll_booths_no_payment.json"
+
+
+def bad_tolls(cfg) -> list[tuple[int, int]]:
+    """Toll booth paths where pressing activate took no payment (learned while driving; the router avoids
+    them). The map doesn't say which booths have a payment machine."""
+    path = logs_dir(cfg) / BAD_TOLLS
+    try:
+        return [(int(item, 16), int(sub)) for item, sub in json.loads(path.read_text(encoding="utf-8"))]
+    except (OSError, ValueError):
+        return []
+
+
+def remember_bad_toll(cfg, lm, lane: int) -> None:
+    path = logs_dir(cfg) / BAD_TOLLS
+    known = [[f"{i:x}", s] for i, s in bad_tolls(cfg)]
+    entry = [f"{int(lm.lane_item[lane]):x}", int(lm.lane_sub[lane])]
+    if entry not in known:
+        path.write_text(json.dumps(known + [entry]), encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=["speed", "steer", "full"], default="full")
@@ -491,7 +618,18 @@ def main() -> int:
                         help="hand back before every intersection instead of giving way by the map's rules")
     parser.add_argument("--mission", action="store_true",
                         help="Phase 4: run the active job (fuel and rest stops, decisions to logs/decisions.jsonl)")
+    parser.add_argument("--no-learning", action="store_true", help="drive with the defaults: learn nothing, apply nothing")
+    parser.add_argument("--stdin-quit", action="store_true",
+                        help="quit (as Ctrl+C: hand back first) when stdin closes or reads 'quit' (tools/launcher.py)")
     args = parser.parse_args()
+    if args.stdin_quit:
+        def watch_stdin():
+            for line in sys.stdin:
+                if line.strip() == "quit":
+                    break
+            _thread.interrupt_main()
+
+        threading.Thread(target=watch_stdin, name="stdin-quit", daemon=True).start()
     lateral = args.mode in ("steer", "full")
     longitudinal = args.mode in ("speed", "full")
 
@@ -526,7 +664,7 @@ def main() -> int:
                 if spec and got is None:
                     print(f"unknown destination {spec!r} (use CITY, CITY:COMPANY or X,Y with the game's tokens)")
                     return 1
-            world = load_world(map_dir(cfg), lm, rules=not args.no_rules)
+            world = load_world(map_dir(cfg), lm, rules=not args.no_rules, avoid=bad_tolls(cfg))
             router, junctions, rules = world.router, world.junctions, world.rules
         ap = Autopilot(lm, geom, mode, lateral=lateral, longitudinal=longitudinal, speed_params=sp,
                        relative_gain=consts.get("c_rsteersens", 0.42),
@@ -551,11 +689,23 @@ def main() -> int:
         if args.mission:
             services = Services(lm, map_dir(cfg), no_go=rules.cars_only() if rules is not None else None)
             mp, pp, ep, actp = mission_settings(cfg)
+            mp.plan_in_background = True
+            sys.setswitchinterval(0.001)                # the driving loop gets its turn quickly while a plan is made
             decisions = DecisionLog(logs_dir(cfg) / "decisions.jsonl")
             mission = Mission(world, services, decisions, JobHistory(logs_dir(cfg) / "jobs.jsonl"), mp, ep, pp, actp)
             g_fatigue = profile_setting(cfg, "g_fatigue")
             mission.profile_fatigue = None if g_fatigue is None else g_fatigue.strip() not in ("0", "")
-            md = MissionDriver(ap, mission)
+            profile = active_controls_file(cfg).parent
+
+            def job_trailer():
+                try:
+                    return saves.job_trailer(profile)
+                except Exception as e:                  # noqa: BLE001 (no pycryptodome, a save being written)
+                    print(f"couldn't read the job trailer from the save: {e}")
+                    return None
+
+            hook = abs(float(cfgb.truck.hook_position.z)) or 1.57
+            md = MissionDriver(ap, mission, trailer_source=job_trailer, hook_back_m=hook if hook < 4 else 1.57)
             if target is not None:
                 mission.set_free_target(target)         # driven to while no job is active
             mission.update(s.reader.read_latest(), s.reader.read_config(), [])
@@ -565,7 +715,22 @@ def main() -> int:
                   f"decisions -> {decisions.path}")
         s.safety.set_axes(steering=lateral, pedals=longitudinal)
         s.safety.reset()
+        if world is not None:
+            ap.entrances = world.entrances
+        s.reader.poll_events()                      # the game keeps old events (the last job's delivery): skip them
+        learned_dir = cache_dir(cfg) / "learned"
+        learner = None
+        if not args.no_learning:
+            learner = Learner(learned_dir / "learned.json", lm)
+            learner.attach(sp, ap.lat, router)
+            ap.caution = learner.caution
+            print("learning: on (" + "; ".join(learner.summary()[:2]) + f"), {learned_dir}")
         drv = Driver(s, ap, lateral, longitudinal, places, target, fallback, mission=md)
+        drv.learner, drv.feed = learner, OverlayFeed()
+        drv.capacity_l = float(cfgb.truck.fuel_capacity)
+        if lateral and longitudinal:
+            view = GameScreen(s.reader.header().game_pid)
+            drv.wipers, drv.grab_view = WiperControl(lambda name: s.controls.press(name), learned_dir / "rain.json"), view.grab_all
         s.recorder and s.recorder.note(event="start", mode=args.mode, steering_mode=mode,
                                        geometry=dataclasses.asdict(geom), speed=dataclasses.asdict(sp))
         print(f"truck {text(cfgb.truck.brand)} {text(cfgb.truck.name)}: wheelbase {geom.wheelbase:.2f} m; "
@@ -581,6 +746,12 @@ def main() -> int:
             if drv.engaged:
                 drv.disengage("AutoHaul stopped (time limit / quit)", fault=True)
                 time.sleep(0.6)                      # let the alarm beep play
+            if learner is not None:
+                card = learner.end_session()
+                if card:
+                    print(f"\nlearned: {card}")
+            if drv.wipers is not None:
+                drv.wipers.save()
             st = drv.stats
             print(f"\n\nengaged {st['engagements']}x, {st['engaged_s'] / 60:.1f} min, {st['engaged_km']:.2f} km; "
                   f"faults: {st['faults'] or 'none'}")

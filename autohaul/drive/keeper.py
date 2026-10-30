@@ -59,7 +59,8 @@ class Keeper:
             return KeeperStep(hold=hold, problem=problem)
         return KeeperStep(press=press, problem=problem)
 
-    def step(self, f, want_move: bool, dt: float, now: float) -> KeeperStep:
+    def step(self, f, want_move: bool, dt: float, now: float, reversing: bool = False) -> KeeperStep:
+        """`reversing`: AutoHaul put the truck in reverse itself (coupling): leave the gearbox alone."""
         p = self.p
         if self._holding and now < self._hold_until:
             return KeeperStep(hold=self._holding, problem="starting the engine")
@@ -72,11 +73,11 @@ class Keeper:
             return self._attempt("starting the engine", now, hold="engine")
         if p.release_parking_brake and want_move and f.parking_brake:
             return self._attempt("releasing the parking brake", now, press="parkingbrake")
-        if p.keep_in_drive and want_move and f.displayed_gear < 0:
+        if p.keep_in_drive and want_move and f.displayed_gear < 0 and not reversing:
             if f.speed < -0.3:
                 return KeeperStep(problem="stopping before shifting out of reverse")
             return self._attempt("shifting from reverse to drive", now, press="geardrive")
-        stuck = p.keep_in_drive and want_move and f.displayed_gear == 0 and f.speed > -0.2
+        stuck = p.keep_in_drive and want_move and f.displayed_gear == 0 and f.speed > -0.2 and not reversing
         self._neutral = self._neutral + dt if stuck else 0.0
         if self._neutral > p.neutral_s:
             return self._attempt("shifting from neutral to drive", now, press="geardrive")

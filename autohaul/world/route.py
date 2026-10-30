@@ -8,6 +8,10 @@ Cost model (metres): lane length, plus a turn penalty at sharp joins, plus `lane
 A node is a whole lane, reached "at its end"; a lane change moves to the parallel lane of the same road,
 whose end is at the same place, so it only adds the penalty. `no_go` lanes are never used (paths the map
 reserves for cars, e.g. the car pumps of a fuel station).
+
+`avoid` lanes cost `avoid_m` extra instead: junction paths the map flags for small vehicles only. The flag steers
+the AI; the game's GPS sends the player's truck through them (2026-10-29: treated as impassable, 3 lanes of 3-53 m
+made AutoHaul's way Amsterdam -> Paris 65 game km longer than the GPS's). They're never a destination.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ class Route:
     expanded: int = 0
     rest_after: list = field(default_factory=list)   # rest_after[i]: driving metres from the end of lanes[i]
     lane_index: dict = field(default_factory=dict)   # lane -> position in `lanes`
+    scaled_m: float = 0.0               # length in open-road-equivalent metres (a city metre counts 3/19)
 
     def __post_init__(self):
         self.lane_index = {ln: i for i, ln in enumerate(self.lanes)}
@@ -57,7 +62,8 @@ class Route:
 
 class Router:
     def __init__(self, lm: LaneMap, graph: LaneGraph, lane_change_m: float = 80.0, turn_penalty_m_per_rad: float = 20.0,
-                 no_go: np.ndarray | None = None, snap_m: float = 2000.0, weight: np.ndarray | None = None):
+                 no_go: np.ndarray | None = None, snap_m: float = 2000.0, weight: np.ndarray | None = None,
+                 avoid: np.ndarray | None = None, avoid_m: float = 200.0):
         """`weight`: per lane, what a metre of it costs (city_weights: 3/19 inside a city area, 1 outside). The
         game's GPS counts distance in game km, and a city metre is 3 game metres against 19 on the open road;
         unweighted, AutoHaul took routes the GPS doesn't (a U-turn out of Rotterdam instead of through it)."""
@@ -65,6 +71,8 @@ class Router:
         self.g = graph
         self.snap_m = snap_m          # no lane near the destination point (a city centre): the nearest within this
         self._no_go = (np.zeros(len(graph.length), dtype=bool) if no_go is None else np.asarray(no_go, bool)).tolist()
+        soft = np.zeros(len(graph.length), dtype=bool) if avoid is None else np.asarray(avoid, bool)
+        self._no_goal = soft.tolist()
         self.lane_change_m = lane_change_m
         self.turn_penalty = turn_penalty_m_per_rad
         # plain Python lists: much faster than numpy scalars inside the search loop
@@ -73,7 +81,9 @@ class Router:
         self._ey = lm.seg[last, 3].tolist()
         self._len = graph.length.tolist()
         w = np.ones(len(graph.length)) if weight is None else np.asarray(weight, float)
-        self._cost = (graph.length * w).tolist()
+        self._scaled = (graph.length * w).tolist()
+        self.penalty = np.where(soft, avoid_m, 0.0)     # extra cost per lane (the learned ones are added to it)
+        self._cost = (graph.length * w + self.penalty).tolist()
         self._h = float(w.min()) if len(w) else 1.0          # admissible: no metre costs less than this
         self._sp = graph.succ_ptr.tolist()
         self._si = graph.succ_idx.tolist()
@@ -97,7 +107,7 @@ class Router:
                 break
             seg = int(idx[j])
             lane = int(self.lm.seg_lane[seg])
-            if lane in out or self._no_go[lane]:
+            if lane in out or self._no_go[lane] or self._no_goal[lane]:
                 continue
             # metres from the closest point to the lane's end
             rest = float(self.lm.seg_len[seg] * (1 - t[j]) + self.lm.seg_len[seg + 1:self.lm.lane_last[lane] + 1].sum())
@@ -110,7 +120,7 @@ class Router:
         s = self.lm.seg
         mx, my = (s[:, 0] + s[:, 2]) / 2, (s[:, 1] + s[:, 3]) / 2
         d = np.hypot(mx - x, my - y)
-        d[np.asarray(self._no_go)[self.lm.seg_lane]] = np.inf
+        d[(np.asarray(self._no_go) | np.asarray(self._no_goal))[self.lm.seg_lane]] = np.inf
         i = int(np.argmin(d))
         return (float(mx[i]), float(my[i])) if d[i] <= max_dist else None
 
@@ -185,4 +195,13 @@ class Router:
         rest[-1] = -goal_rest                     # the destination lies goal_rest before the last lane's end
         for i in range(len(lanes) - 2, -1, -1):
             rest[i] = rest[i + 1] + (0.0 if changes[i + 1] else self._len[lanes[i + 1]])
-        return Route(lanes, changes, max(length, 0.0), target, expanded, rest)
+        ratio = lambda ln: self._scaled[ln] / self._len[ln] if self._len[ln] > 0 else 1.0     # noqa: E731
+        scaled = g0 * ratio(lanes[0]) + sum(self._scaled[ln] for ln, ch in zip(lanes[1:], changes[1:]) if not ch) \
+            - goal_rest * ratio(lanes[-1])
+        return Route(lanes, changes, max(length, 0.0), target, expanded, rest, scaled_m=max(scaled, 0.0))
+
+    def add_penalties(self, penalties: dict[int, float]) -> None:
+        """Extra cost (metres) on lanes: what `autohaul.learn` has learned from the game's GPS."""
+        for lane, extra in penalties.items():
+            self.penalty[lane] += extra
+            self._cost[lane] += extra

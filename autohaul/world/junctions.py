@@ -74,6 +74,8 @@ class Junctions:
         self._items = items[order]
         self._cache: dict[int, list[Conflict]] = {}
         self._items_cache: dict[int, bool] = {}
+        self._geom: dict[int, dict] = {}             # per junction: its paths' trimmed lines and bounding boxes
+        self._succ: dict[int, set[int]] = {}
 
     def lanes_of(self, item: int) -> np.ndarray:
         lo = np.searchsorted(self._items, np.uint64(item), "left")
@@ -90,6 +92,49 @@ class Junctions:
         keep = (d >= self.end_margin) & (d <= d[-1] - self.end_margin)
         return pts[keep], int(np.argmax(keep)), d
 
+    def _item_geom(self, item: int) -> dict:
+        """The junction's paths, trimmed, with bounding boxes, so pairs that can't touch are skipped: on a big
+        interchange (100-140 paths) working through every pair blocked the driving loop for 2-4 s the first time it
+        came into range (2026-10-30: blind for 66 m at 79 km/h)."""
+        g = self._geom.get(item)
+        if g is None:
+            lanes = self.lanes_of(item).tolist()
+            trimmed = {ln: self._trimmed(ln) for ln in lanes}
+            usable = [ln for ln in lanes if len(trimmed[ln][0]) >= 2]
+            box = np.array([[*trimmed[ln][0].min(axis=0), *trimmed[ln][0].max(axis=0)] for ln in usable]).reshape(-1, 4)
+            g = self._geom[item] = {"trimmed": trimmed, "usable": usable, "box": box,
+                                    "index": {ln: i for i, ln in enumerate(usable)}}
+        return g
+
+    def _near_paths(self, g: dict, lane: int) -> list[int]:
+        """The junction's other paths whose bounding box overlaps this one's."""
+        i = g["index"].get(lane)
+        if i is None:
+            return []
+        box = g["box"]
+        hit = (box[:, 0] <= box[i, 2]) & (box[:, 2] >= box[i, 0]) & (box[:, 1] <= box[i, 3]) & (box[:, 3] >= box[i, 1])
+        hit[i] = False
+        usable = g["usable"]
+        return [usable[k] for k in np.flatnonzero(hit).tolist()]
+
+    def _successors(self, lane: int) -> set[int]:
+        s = self._succ.get(lane)
+        if s is None:
+            s = self._succ[lane] = {c for c, _ in self.lm.successors(lane)}
+        return s
+
+    def _crossing(self, g: dict, lane: int, other: int):
+        """Where `lane` first crosses `other` at the same height: (i, t, j, u, k0, k1), or None."""
+        mine, k0, _ = g["trimmed"][lane]
+        theirs, k1, _ = g["trimmed"][other]
+        hit = _first_crossing(mine, theirs)
+        if hit is None:
+            return None
+        i, t, j, u = hit
+        if abs(self._height(lane, k0 + i, t) - self._height(other, k1 + j, u)) > self.level:
+            return None                                     # a flyover, not a crossing
+        return i, t, j, u, k0, k1
+
     def _height(self, lane: int, seg: int, t: float) -> float:
         z0, z1 = self.lm.seg[self.lm.lane_first[lane] + seg, 4:6]
         return float(z0 + t * (z1 - z0))
@@ -102,30 +147,28 @@ class Junctions:
         out: list[Conflict] = []
         lm = self.lm
         if lm.lane_kind[lane] == KIND_PREFAB:
-            mine, k0, d0 = self._trimmed(lane)
-            others = [o for o in self.lanes_of(int(lm.lane_item[lane])).tolist() if o != lane]
+            item = int(lm.lane_item[lane])
+            g = self._item_geom(item)
+            mine, k0, d0 = g["trimmed"][lane]
+            others = [o for o in self.lanes_of(item).tolist() if o != lane]
             if len(mine) >= 2:
-                for other in others:
-                    theirs, k1, d1 = self._trimmed(other)
-                    if len(theirs) < 2:
+                for other in self._near_paths(g, lane):
+                    found = self._crossing(g, lane, other)
+                    if found is None:
                         continue
-                    hit = _first_crossing(mine, theirs)
-                    if hit is None:
-                        continue
-                    i, t, j, u = hit
-                    if abs(self._height(lane, k0 + i, t) - self._height(other, k1 + j, u)) > self.level:
-                        continue                                    # a flyover, not a crossing
+                    i, t, j, u, k0, k1 = found
+                    d1 = g["trimmed"][other][2]
                     x, y = mine[i] + t * (mine[i + 1] - mine[i])
                     s_mine = d0[k0 + i] + t * (d0[k0 + i + 1] - d0[k0 + i])
                     s_other = d1[k1 + j] + u * (d1[k1 + j + 1] - d1[k1 + j])
                     out.append(self._with_zone(Conflict(other, "cross", float(s_mine), float(s_other),
                                                         float(x), float(y)), lane))
             # merges: both lead into the same lane, from different places
-            nxt = {c for c, _ in lm.successors(lane)}
+            nxt = self._successors(lane)
             if nxt:
                 start, end = lm.seg[lm.lane_first[lane], 0:2], lm.seg[lm.lane_last[lane], 2:4]
                 for other in others:
-                    if not nxt & {c for c, _ in lm.successors(other)}:
+                    if not nxt & self._successors(other):
                         continue
                     if np.hypot(*(lm.seg[lm.lane_first[other], 0:2] - start)) < 2.0:
                         continue                                    # same start: an alternative, not a merge
@@ -151,5 +194,7 @@ class Junctions:
         curves that don't cross, so the whole junction counts."""
         item = int(item)
         if item not in self._items_cache:
-            self._items_cache[item] = any(self.crossings(ln) for ln in self.lanes_of(item).tolist())
+            g = self._item_geom(item)
+            self._items_cache[item] = any(self._crossing(g, ln, other) is not None
+                                          for ln in g["usable"] for other in self._near_paths(g, ln))
         return self._items_cache[item]

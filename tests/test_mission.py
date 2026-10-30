@@ -167,7 +167,7 @@ def test_planner_needs_and_choices():
     assert "refuel" in plan.record["rationale"] and plan.record["options"]
     plan = planner.plan(PlanState(rt, fuel_l=50.0, next_rest=100.0, **base), 100.0)   # 40 min to spare
     assert sorted(s.kind for s in plan.stops) == ["fuel", "sleep"]
-    plan = planner.plan(PlanState(rt, fuel_l=10.0, next_rest=None, **base), 100.0)
+    plan = planner.plan(PlanState(rt, fuel_l=5.0, next_rest=None, **base), 100.0)
     assert plan.problem and "no fuel station reachable" in plan.problem
 
 
@@ -301,3 +301,35 @@ def test_quick_park_delivers_at_the_destination(tmp_path):
 def test_quick_park_that_does_nothing_hands_back(tmp_path):
     fault, pressed, game, log = _park_run(tmp_path, loaded=True, quick_park=False)
     assert fault and fault.startswith("quick park didn't deliver") and len(pressed) == 2
+
+
+
+def test_a_job_that_says_loaded_without_a_trailer_goes_for_the_trailer_first(tmp_path):
+    """2026-10-29: a freight-market job reported its cargo loaded while the trailer still waited at the depot the
+    truck stood in; AutoHaul set off for the destination (through the yard fence). Now: no trailer coupled ->
+    the trailer leg; at the depot, quick park hooks it up; then on to the destination."""
+    world, services, pump, bed = make_station_world()
+    geom = TruckGeometry()
+    sim = TruckSim(geom, x=3790.0, y=0.0, rotation=0.0, speed=0.0)        # standing at the source depot
+    job = {"cargo": "bars", "loaded": True, "deadline": 600 + 600, "income": 9000, "source_city": "b",
+           "source_company": "d", "destination_city": "c", "destination_company": "e"}
+    world.places = SimpleNamespace(company=lambda city, company: Place(3800.0 if city == "b" else 1e6, 0.0,
+                                                                         f"{company} in {city}"))
+    game = SimGame(sim, job=job, fuel_l=400.0, capacity_l=500.0, game_time=600, fatigue=False, trailer=False)
+    mission = Mission(world, services, DecisionLog(tmp_path / "d.jsonl"), JobHistory(tmp_path / "j.jsonl"),
+                      MissionParams(fatigue="off"), action_params=ActionParams(settle_s=0.3, park_wait_s=2.0))
+    md = MissionDriver(Autopilot(world.lm, geom, "relative", router=world.router, junctions=world.junctions), mission)
+    mission.update(game.frame(80 / 3.6), game.config(), [])
+    assert mission.state == "to trailer"
+    md.engage(game.frame(80 / 3.6))
+    pressed = []
+    for _ in range(int(20 / sim.p.dt)):
+        out = md.step(game.frame(80 / 3.6), game.config(), game.events(), [], sim.p.dt)
+        pressed += out.press
+        if out.fault or out.status.fault:
+            break
+        game.buttons(out.press, out.hold)
+        game.step(out.cmd.steer, out.cmd.throttle, out.cmd.brake)
+        if game.trailer and mission.state == "to destination":
+            break
+    assert "quickpark" in pressed and game.trailer and mission.state == "to destination"

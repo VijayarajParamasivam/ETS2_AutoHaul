@@ -5,8 +5,8 @@ read), driven by the same commands AutoHaul sends to the game:
   steering   relative mode: wheel turn rate = -rate_gain * axis (c_rsteersens), with an input delay,
              optional game-side deadzone; absolute mode: wheel = -axis
   lateral    kinematic single-track model at the rear axle, with an understeer factor and a yaw lag
-  pedals     engine force limited by power, air brakes with a lag, rolling + air resistance, slope,
-             engine braking when coasting, and gear-shift torque interruptions
+  pedals     engine force limited by power (backwards in reverse), air brakes with a lag, rolling + air
+             resistance, slope, engine braking when coasting, and gear-shift torque interruptions
 Defaults are a Volvo FH tractor (wheels from telemetry on 1.53.2.1) without a trailer.
 """
 
@@ -62,6 +62,7 @@ class SimTruck:
     brk: float = 0.0
     shift_left: float = 0.0
     last_shift_speed: float = 0.0
+    gear: int = 1                     # 1 drive, -1 reverse, 0 neutral (the automatic gearbox's selector)
 
 
 class TruckSim:
@@ -132,17 +133,17 @@ class TruckSim:
             s.shift_left = p.shift_time_s
             s.last_shift_speed = s.speed
         v = s.speed
-        drive = 0.0 if s.shift_left > 0 else s.thr * min(p.max_drive_force, p.power / max(abs(v), 1.0))
-        resist = p.mass * G * (p.c_rr + p.grade) + 0.5 * 1.2 * p.cda * v * abs(v)
-        if s.thr < 0.05 and s.shift_left <= 0:
-            resist += p.mass * p.engine_brake * min(1.0, abs(v) / 5.0)
+        drive = 0.0 if s.shift_left > 0 else s.gear * s.thr * min(p.max_drive_force, p.power / max(abs(v), 1.0))
+        f = drive - p.mass * G * p.grade - 0.5 * 1.2 * p.cda * v * abs(v)
+        if s.thr < 0.05 and s.shift_left <= 0 and s.gear:
+            f -= math.copysign(p.mass * p.engine_brake * min(1.0, abs(v) / 5.0), v)
         braking = s.brk * p.brake_force * p.mass
-        f = drive - resist
-        if abs(v) < 0.05 and abs(f) <= braking + p.mass * G * p.c_rr:
+        rolling = p.mass * G * p.c_rr
+        if abs(v) < 0.05 and abs(f) <= braking + rolling:
             self.accel = 0.0
             s.speed = 0.0
         else:
-            f -= math.copysign(braking, v if abs(v) > 0.05 else f)
+            f -= math.copysign(braking + rolling, v if abs(v) > 0.05 else f)
             self.accel = f / p.mass
             nv = v + self.accel * dt
             s.speed = 0.0 if (v > 0 > nv or v < 0 < nv) and s.brk > 0.05 else nv
@@ -165,7 +166,7 @@ class TruckSim:
             input_brake=self.input_brake,
             wheel_steering=[wl / TWO_PI, wr / TWO_PI, 0.0, 0.0],
             navigation_speed_limit=speed_limit, parking_brake=0, engine_enabled=1, electric_enabled=1,
-            displayed_gear=1 if s.speed >= 0 else -1, cruise_control=0.0, multiplayer_time_offset=0,
+            displayed_gear=s.gear, cruise_control=0.0, multiplayer_time_offset=0,
         )
 
 

@@ -43,6 +43,7 @@ class LightVisionParams:
     lamp_radius_m: float = 0.12         # lit part of a lamp
     min_fraction: float = 0.25          # of the lamp's expected pixel area
     min_pixels: int = 3
+    max_lamp_ratio: float = 25.0        # a colour patch over this many lamps' areas is a sign or a roof, not lamps
     read_every_s: float = 0.1
     stable_reads: int = 2
     lamp_height_m: float = 5.0          # for the viewing distance: typical lamp height above the road
@@ -54,12 +55,14 @@ class LightVisionParams:
 
 
 def classify(rgb: np.ndarray) -> dict[str, int]:
-    """Pixel counts of lit red, amber and green lamp colours in an (h, w, 3) uint8 picture."""
+    """Pixel counts of lit red, amber and green lamp colours in an (h, w, 3) uint8 picture. Lit lamps are near
+    full brightness and saturation (1.53: green ~(40, 248, 35), red ~(250, 30, 27)); sunlit leaves, red roofs
+    and orange signs are dimmer or less pure, and were read as lamps with looser limits."""
     a = rgb.reshape(-1, 3).astype(np.int16)
     r, g, b = a[:, 0], a[:, 1], a[:, 2]
-    red = (r >= 180) & (g <= 100) & (b <= 100) & (r - g >= 120)
-    amber = (r >= 200) & (g >= 110) & (g <= 215) & (b <= 110) & (r - b >= 120)
-    green = (g >= 180) & (r <= 130) & (g - r >= 90)
+    red = (r >= 230) & (g <= 90) & (b <= 90)
+    amber = (r >= 235) & (g >= 120) & (g <= 210) & (b <= 80)
+    green = (g >= 225) & (r <= 110) & (g - b >= 40)
     return {"red": int(red.sum()), "amber": int(amber.sum()), "green": int(green.sum())}
 
 
@@ -135,8 +138,9 @@ class LightVision:
         if not info["seen"]:
             return None, info
         info["need"] = round(need, 1)
+        too_big = p.max_lamp_ratio * max(need / p.min_fraction, p.min_pixels) * info["seen"] + 50
         for colour in ("red", "amber", "green"):
-            if info["counts"][colour] >= need:
+            if need <= info["counts"][colour] <= too_big:
                 return colour, info
         return None, info
 

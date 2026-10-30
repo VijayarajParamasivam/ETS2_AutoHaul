@@ -414,6 +414,7 @@ def _toll_run(crossroads, pay: bool, seconds=90.0):
             log["fault"] = st.fault
             break
         sim.step(cmd.steer, cmd.throttle, cmd.brake)
+    log["failed_lane"] = ap.gw.failed_toll_lane
     return log
 
 
@@ -430,6 +431,7 @@ def test_toll_gate_without_payment_hands_back(crossroads):
     log = _toll_run(crossroads, pay=False)
     assert log["fault"] and log["fault"].startswith("toll gate: no payment")
     assert len(log["press"]) == 3 and max(log["x"]) < LINE_X + 9.0
+    assert log["failed_lane"] == 1                                 # remembered: the router avoids it next time
 
 
 
@@ -472,3 +474,37 @@ def test_a_light_in_view_with_no_lamp_lit_is_a_give_way_junction(crossroads):
     assert log["fault"] == "destination reached: take over"
     x, v = np.array(log["x"]), np.array(log["v"])
     assert ((v < 0.3) & (x < LINE_X)).any()                        # it did stop and look first
+
+
+def test_a_light_out_of_view_is_read_from_the_cross_traffic(crossroads):
+    """2026-10-29: the light went out of view as the truck stopped and it stood there for good. The AI obeys the
+    lights: cross traffic moving on another signal group means red; once it stops, go."""
+    from autohaul.sim.lights import ScriptedLights
+    lm, g, main, after = crossroads
+    r = _rules(lm, ours=12, theirs=6)
+    r.sem_id[1] = 0
+    r.sem_id[2] = 1
+    _with_lights(r, sids=(0, 1))
+    # a stream of cars on the main road until ~30 s (their green), then nothing
+    cars = [SimVehicle(300 + i, main, s=520 - 12.0 * (14 + 3.0 * i), speed=12.0) for i in range(6)]
+    beside = ScriptedLights(lambda lane, item, t: None, lambda: 0.0, dark=True)   # the head beside the cab
+    log = _run(lm, g, tuple(after[-20]), r, cars, lights=beside)
+    assert log["fault"] == "destination reached: take over"
+    x, v = np.array(log["x"]), np.array(log["v"])
+    assert ((v < 0.3) & (x < LINE_X)).any()                         # stopped while the cross traffic ran
+    assert any("red light" in n for n in log["note"])
+    length = TruckGeometry().front_bumper + 3.5
+    for k in range(len(x)):
+        if x[k] > 418 and x[k] - length < 422:
+            for vx, vy in log["veh"][k]:
+                assert not (abs(vx - 420) < 3 and abs(vy) < 6), "a car crossed while the truck was in the way"
+
+
+def test_lamp_colours_need_lamp_brightness():
+    from autohaul.vision.lights import classify
+    lamp_green = np.array([[[40, 248, 35]] * 10], dtype=np.uint8)
+    leaves = np.array([[[120, 200, 70]] * 10], dtype=np.uint8)        # sunlit foliage
+    roof = np.array([[[190, 60, 50]] * 10], dtype=np.uint8)           # a red roof
+    lamp_red = np.array([[[250, 30, 27]] * 10], dtype=np.uint8)
+    assert classify(lamp_green)["green"] == 10 and classify(leaves)["green"] == 0
+    assert classify(lamp_red)["red"] == 10 and classify(roof)["red"] == 0

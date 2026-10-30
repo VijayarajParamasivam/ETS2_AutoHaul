@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 # Phase 1 runtime was stdlib + ctypes only; Phase 2 adds numpy (lane map). Vision deps arrive later.
 dependencies = [
     "numpy>=1.26",
+    "pycryptodome>=3.20",   # Phase 5: reading the job trailer's position from the (encrypted) save
 ]
 
 [project.optional-dependencies]

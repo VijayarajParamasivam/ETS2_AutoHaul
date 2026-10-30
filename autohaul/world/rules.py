@@ -107,6 +107,29 @@ class JunctionRules:
         hi = np.searchsorted(self.sem_item, np.uint64(item), "right")
         return lo + np.flatnonzero(self.sem_sid[lo:hi] == sid)
 
+    def unpayable_toll_lanes(self, lane_item: np.ndarray) -> np.ndarray:
+        """(L,) bool: toll booth paths controlled by an `ab_toll_no` semaphore in a plaza that also has paying
+        booths (20 plazas on 1.53). The router keeps to the paying ones."""
+        out = np.zeros(len(self.sem_id), dtype=bool)
+        names = self.profile_names
+        no = {i for i, n in enumerate(names) if n == "ab_toll_no"}
+        if not no:
+            return out
+        items_no, items_pay = set(), set()
+        for it, pi in zip(self.sem_item.tolist(), self.sem_profile.tolist()):
+            if pi in no:
+                items_no.add(int(it))
+            elif 0 <= pi < len(names) and profile_kind(names[pi]) == "toll gate":
+                items_pay.add(int(it))
+        mixed = items_no & items_pay
+        for ln in np.flatnonzero(self.sem_id >= 0):
+            item = int(lane_item[ln])
+            if item in mixed:
+                heads = self.semaphores(int(ln), item)
+                if len(heads) and all(int(self.sem_profile[h]) in no for h in heads):
+                    out[ln] = True
+        return out
+
     def toll_plaza(self, item: int) -> bool:
         """The junction has a toll booth (any of its semaphores has a toll profile)."""
         cache = self.__dict__.setdefault("_plaza", {})
