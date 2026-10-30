@@ -112,17 +112,30 @@ def test_drives_out_of_a_yard_onto_the_lane():
     assert abs(sim.s.y) < 0.6 and sim.s.x > 250              # on the lane and driving on
 
 
-def test_headlights_on_at_night_off_in_the_morning_only_if_ours():
+def test_headlights_follow_the_clock_whoever_switched_them_on():
+    """2026-10-30: they only switched off lights AutoHaul had switched on; they'd been on all along, so it did nothing."""
     hl = Headlights()
     night, day = 22 * 60, 10 * 60
     assert hl.step(night, low_beam=False, parking=False, now=0.0) == "light"
     assert hl.step(night, low_beam=False, parking=True, now=0.1) is None          # wait for telemetry
     assert hl.step(night, low_beam=False, parking=True, now=1.0) == "light"
     assert hl.step(night, low_beam=True, parking=False, now=2.0) is None
-    assert hl.step(day, low_beam=True, parking=False, now=3.0) == "light"         # ours: switch off
+    assert hl.step(day, low_beam=True, parking=False, now=3.0) == "light"         # morning: off
     assert hl.step(day, low_beam=False, parking=False, now=4.0) is None
-    yours = Headlights()
-    assert yours.step(day, low_beam=True, parking=False, now=0.0) is None         # you switched them on
+    left_on = Headlights()
+    assert left_on.step(day, low_beam=True, parking=False, now=0.0) == "light"    # on from before, by day: off too
+    high = Headlights()
+    assert high.step(night, low_beam=True, parking=False, now=0.0, high_beam=True) == "hblight"
+    assert high.step(night, low_beam=True, parking=False, now=1.0, high_beam=False) is None
+
+
+def test_headlights_leave_alone_what_you_just_changed():
+    hl = Headlights()
+    day = 10 * 60
+    assert hl.step(day, low_beam=False, parking=False, now=0.0) is None
+    assert hl.step(day, low_beam=True, parking=False, now=50.0) is None           # you switched them on
+    assert hl.step(day, low_beam=True, parking=False, now=300.0) is None          # left alone for a while
+    assert hl.step(day, low_beam=True, parking=False, now=700.0) == "light"       # ... then the clock again
 
 
 def load_drive_tool():

@@ -12,6 +12,10 @@ reserves for cars, e.g. the car pumps of a fuel station).
 `avoid` lanes cost `avoid_m` extra instead: junction paths the map flags for small vehicles only. The flag steers
 the AI; the game's GPS sends the player's truck through them (2026-10-29: treated as impassable, 3 lanes of 3-53 m
 made AutoHaul's way Amsterdam -> Paris 65 game km longer than the GPS's). They're never a destination.
+
+Height change inside a junction costs `climb_m_per_m`: a lane change costs 80 m, so from an exit-only lane the way down a
+ramp, through the junction at the bottom and back up looked cheaper than changing lanes and going straight over the bridge
+(2026-10-30: about 20 km/h for over a minute, twice). A truck pays for that climb, and it ends up on the bridge.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from autohaul.world.graph import LaneGraph
-from autohaul.world.lanemap import LaneMap
+from autohaul.world.lanemap import KIND_PREFAB, LaneMap
 
 
 @dataclass
@@ -63,7 +67,7 @@ class Route:
 class Router:
     def __init__(self, lm: LaneMap, graph: LaneGraph, lane_change_m: float = 80.0, turn_penalty_m_per_rad: float = 20.0,
                  no_go: np.ndarray | None = None, snap_m: float = 2000.0, weight: np.ndarray | None = None,
-                 avoid: np.ndarray | None = None, avoid_m: float = 200.0):
+                 avoid: np.ndarray | None = None, avoid_m: float = 200.0, climb_m_per_m: float = 12.0):
         """`weight`: per lane, what a metre of it costs (city_weights: 3/19 inside a city area, 1 outside). The
         game's GPS counts distance in game km, and a city metre is 3 game metres against 19 on the open road;
         unweighted, AutoHaul took routes the GPS doesn't (a U-turn out of Rotterdam instead of through it)."""
@@ -82,7 +86,10 @@ class Router:
         self._len = graph.length.tolist()
         w = np.ones(len(graph.length)) if weight is None else np.asarray(weight, float)
         self._scaled = (graph.length * w).tolist()
-        self.penalty = np.where(soft, avoid_m, 0.0)     # extra cost per lane (the learned ones are added to it)
+        climb = np.zeros(len(graph.length))
+        np.add.at(climb, lm.seg_lane, np.abs(lm.seg[:, 5] - lm.seg[:, 4]))
+        climb[np.asarray(lm.lane_kind) != KIND_PREFAB] = 0.0
+        self.penalty = np.where(soft, avoid_m, 0.0) + climb_m_per_m * climb   # extra cost per lane (learned ones add to it)
         self._cost = (graph.length * w + self.penalty).tolist()
         self._h = float(w.min()) if len(w) else 1.0          # admissible: no metre costs less than this
         self._sp = graph.succ_ptr.tolist()

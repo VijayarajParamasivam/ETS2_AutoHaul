@@ -20,6 +20,14 @@ And, per lane of the map (kept by map item and lane, so it survives a rebuilt ma
   route          the game's GPS is the teacher: following its own route, AutoHaul saw the GPS distance jump up while
                  its own remaining distance didn't (the GPS wanted another road): that lane costs more from now on,
                  so the routes come to agree. If its own distance jumped too, it missed a turn: no lesson for the route.
+From you, whenever you drive:
+  lessons        after any hand-over (a fault, a sharp turn, a toll gate, or you just taking control) it watches how you
+                 drive the next stretch: your speed and your line, every 5 m along each lane of the junctions and curves
+                 you pass. Next time it follows that line at that speed, and a sharp turn you've shown it is no longer a
+                 reason to hand back. A lesson that ended in damage is thrown away, and speeds on the way to or from a
+                 stop say nothing (that was traffic or a light).
+  toll booths    where you paid: that booth is preferred, is no longer avoided, and it stops where you stopped.
+  your style     your curve speed and how hard you accelerate pull its values your way, slowly.
 A scorecard per drive goes in the same file. If the last drives are clearly worse than the ones before, the driving
 values go back to what they were then.
 """
@@ -33,6 +41,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
+from autohaul.control.vehicle import pose_from_frame
+
 VERSION = 1
 BOUNDS = {
     "lat_acc_max": (1.4, 2.6),
@@ -42,6 +54,7 @@ BOUNDS = {
     "thr_accel": (0.25, 2.5),
     "brake_decel": (2.0, 8.0),
     "c_us": (0.0, 0.004),
+    "accel_max": (0.4, 1.2),
 }
 DRIVER_KEY = "driving key"
 SPOT_FAULTS = ("sharp turn", "off the lane centre", "the wheel is moving against", "lost the lane", "left the way",
@@ -84,6 +97,26 @@ class LearnParams:
     gps_window_s: float = 20.0
     gps_penalty_share: float = 0.5     # of the jump in world metres
     gps_penalty_max_m: float = 1000.0
+    lesson_m: float = 600.0            # a lesson: this far after the hand-over ...
+    lesson_s: float = 120.0            # ... or this long
+    lesson_lane_m: float = 3.5         # within this of a lane counts as driving it
+    lesson_bin_m: float = 5.0
+    lesson_curve: float = 1 / 200.0    # 1/m: only junctions and lanes this curved are places worth a lesson
+    lesson_min_ms: float = 2.5         # slower says nothing about the place
+    lesson_stop_ms: float = 1.0        # a stop: ...
+    lesson_before_stop_m: float = 40.0  # ... the speed this far before it and ...
+    lesson_after_stop_m: float = 30.0  # ... this far after it was about the stop, not the place
+    lesson_speed_slack: float = 1.05   # it may take the place this much faster than you
+    lesson_min_cap_ms: float = 5.0     # never a limit under this
+    lesson_creep: float = 1.03         # each pass it drives alone relaxes the limit by this, until you show otherwise
+    lesson_max_offset_m: float = 1.5   # the most it shifts its line
+    lesson_line_range_m: float = 1.5   # your line must stay within this across the lane to count as a line
+    lesson_max_wear: float = 0.005     # more damage than this during a lesson: nothing to learn from it
+    toll_prefer_m: float = 150.0       # the other booths of a plaza cost this much more than the one you paid at
+    toll_back_min_m: float = 0.5
+    toll_back_max_m: float = 8.0
+    style_alpha: float = 0.01          # your style pulls its values by this share per curve / acceleration
+    style_accel_window_s: float = 1.0
     worse_factor: float = 1.5          # scorecards this much worse: roll back
     rollback_sessions: int = 3
     min_session_km: float = 30.0       # game km engaged for a drive to get a scorecard
@@ -119,6 +152,15 @@ class Learner:
         self.values: dict[str, dict[str, float]] = {"tractor": {}, "trailer": {}}
         self.spots: dict[str, dict] = {}
         self.route_cost: dict[str, float] = {}
+        self.lessons: dict[str, dict] = {}     # lane -> {"n", "why", "bins": [[speed or None, lateral or None], ...]}
+        self.toll_lanes: dict[str, dict] = {}  # booth lane -> {"n", "back_m"}
+        self.lesson: dict | None = None        # the one going on
+        self._lane_rec: dict[int, dict | None] = {}
+        self._rules = None
+        self._gate_s = None
+        self._front_bumper = 3.2
+        self._driver_curve_state: dict | None = None
+        self._driver_accel: tuple | None = None
         self.scorecards: list[dict] = []
         self.snapshots: list[dict] = []
         self.recent: list[str] = []
@@ -151,6 +193,8 @@ class Learner:
         self.values = {"tractor": d.get("values", {}).get("tractor", {}), "trailer": d.get("values", {}).get("trailer", {})}
         self.spots = d.get("spots", {})
         self.route_cost = d.get("route_cost", {})
+        self.lessons = d.get("lessons", {})
+        self.toll_lanes = d.get("toll_lanes", {})
         self.scorecards = d.get("scorecards", [])
         self.snapshots = d.get("snapshots", [])
 
@@ -160,7 +204,8 @@ class Learner:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"version": VERSION, "values": self.values, "spots": self.spots,
-                                   "route_cost": self.route_cost, "scorecards": self.scorecards[-60:],
+                                   "route_cost": self.route_cost, "lessons": self.lessons, "toll_lanes": self.toll_lanes,
+                                   "scorecards": self.scorecards[-60:],
                                    "snapshots": self.snapshots[-20:]}, indent=0), encoding="utf-8")
         os.replace(tmp, self.path)
         self._dirty = False
@@ -193,13 +238,17 @@ class Learner:
             self._log(f"{name} {old:.3f} -> {new:.3f}: {why} ({'with' if self.ctx == 'trailer' else 'no'} trailer)",
                       name=name, old=old, new=new, ctx=self.ctx)
 
-    def attach(self, speed_params=None, lateral=None, router=None) -> None:
-        """Keep these up to date with what's learned: the SpeedParams, the LateralController, the Router's lane costs."""
+    def attach(self, speed_params=None, lateral=None, router=None, rules=None, gate_s=None, front_bumper: float = 3.2) -> None:
+        """Keep these up to date with what's learned: the SpeedParams, the LateralController, the Router's lane costs.
+        `rules` (JunctionRules): to prefer the booths you paid at; `gate_s(lane, item)`: metres along a booth lane to its
+        gate, to learn where you stop."""
         self._sp, self._lat = speed_params, lateral
+        self._rules, self._gate_s, self._front_bumper = rules, gate_s, front_bumper
         self._defaults = {}
         if speed_params is not None:
             self._defaults.update(lat_acc_max=speed_params.lat_acc_max, plan_decel=speed_params.plan_decel,
-                                  thr_accel=speed_params.thr_accel, brake_decel=speed_params.brake_decel)
+                                  thr_accel=speed_params.thr_accel, brake_decel=speed_params.brake_decel,
+                                  accel_max=speed_params.accel_max)
         if lateral is not None:
             self._defaults.update(predict_s=lateral.p.predict_s, omega_max=lateral.p.omega_max)
         self._write_sinks()
@@ -210,7 +259,7 @@ class Learner:
         sp, lat = getattr(self, "_sp", None), getattr(self, "_lat", None)
         d = getattr(self, "_defaults", {})
         if sp is not None:
-            for name in ("lat_acc_max", "plan_decel", "thr_accel", "brake_decel"):
+            for name in ("lat_acc_max", "plan_decel", "thr_accel", "brake_decel", "accel_max"):
                 setattr(sp, name, self.values[self.ctx].get(name, d[name]))
         if lat is not None:
             lat.p.predict_s = self.values[self.ctx].get("predict_s", d["predict_s"])
@@ -223,13 +272,30 @@ class Learner:
 
     def lane_penalties(self) -> dict[int, float]:
         """Lane index -> extra route cost (metres), resolved in the current map."""
-        import numpy as np
         out: dict[int, float] = {}
         for key, cost in self.route_cost.items():
-            item, sub = key.split(":")
-            lanes = np.flatnonzero((self.lm.lane_item == np.uint64(int(item, 16))) & (self.lm.lane_sub == int(sub)))
-            for ln in lanes.tolist():
+            for ln in self._lanes_of_key(key):
                 out[ln] = cost
+        if self._rules is not None:                  # a plaza's other booths cost more than the one you paid at
+            for key in self.toll_lanes:
+                for ln in self._lanes_of_key(key):
+                    item = self.lm.lane_item[ln]
+                    others = np.flatnonzero((self.lm.lane_item == item) & (np.asarray(self._rules.sem_id) >= 0))
+                    for other in others.tolist():
+                        if other != ln and lane_key(self.lm, other) not in self.toll_lanes:
+                            out[other] = out.get(other, 0.0) + self.p.toll_prefer_m
+        return out
+
+    def _lanes_of_key(self, key: str) -> list[int]:
+        item, sub = key.split(":")
+        return np.flatnonzero((self.lm.lane_item == np.uint64(int(item, 16))) & (self.lm.lane_sub == int(sub))).tolist()
+
+    def paid_booths(self) -> set[tuple[int, int]]:
+        """(item, sub) of the booths you've paid at: however a drive went there, they do take payment."""
+        out = set()
+        for key in self.toll_lanes:
+            item, sub = key.split(":")
+            out.add((int(item, 16), int(sub)))
         return out
 
     # ------------------------------------------------------------- what's asked while driving
@@ -242,6 +308,20 @@ class Learner:
             return None
         return max(self.p.spot_min_ms, self.p.spot_speed_share * rec["speed"])
 
+    def bins(self, lane: int) -> list | None:
+        """How you drove this lane, every `lesson_bin_m`: [speed or None, lateral or None], or None if you haven't."""
+        if not self.lessons:
+            return None
+        if lane not in self._lane_rec:
+            self._lane_rec[lane] = self.lessons.get(lane_key(self.lm, lane))
+        rec = self._lane_rec[lane]
+        return rec["bins"] if rec else None
+
+    def toll_back(self, lane: int) -> float | None:
+        """Where you stopped at this booth: metres before its gate, or None."""
+        rec = self.toll_lanes.get(lane_key(self.lm, lane))
+        return rec.get("back_m") if rec else None
+
     def summary(self) -> list[str]:
         """For the overlay."""
         c = self.values[self.ctx]
@@ -250,7 +330,10 @@ class Learner:
                                        ("plan_decel", "Braking", 0.8)):
             lines.append(f"{label} {c.get(name, self._default(name, fallback)):.2f}")
         hot = sum(1 for r in self.spots.values() if r["n"] >= self.p.spot_slow_after)
-        out = ["  ".join(lines), f"Trouble spots: {hot}, route corrections from the GPS: {len(self.route_cost)}"]
+        out = ["  ".join(lines), f"From you: {len(self.lessons)} lanes, {len(self.toll_lanes)} toll booths. "
+               f"Trouble spots: {hot}, route corrections: {len(self.route_cost)}"]
+        if self.lesson is not None:
+            out.insert(0, f"Watching how you drive this ({self.lesson['m']:.0f} of {self.p.lesson_m:.0f} m)")
         return out + self.recent[-1:]
 
     # ------------------------------------------------------------- observing
@@ -275,6 +358,8 @@ class Learner:
 
     def on_fine(self, offence: str, speed: float, lane: int | None) -> None:
         self.s.fines[offence] = self.s.fines.get(offence, 0) + 1
+        if offence == "crash" and self.lesson is not None:
+            self.lesson["crashed"] = True
         if offence == "crash" and lane is not None and self.lm is not None and speed <= self.p.spot_max_ms:
             self._mark_spot(lane, max(speed, 8.0), "a crash")
 
@@ -326,6 +411,12 @@ class Learner:
         if prev is None:
             return
         key = lane_key(self.lm, prev)                # left that lane without an incident: a clean pass
+        taught = self.lessons.get(key)
+        if taught is not None and not note.get("fault"):
+            for row in taught["bins"]:
+                if row[0] is not None:
+                    row[0] *= self.p.lesson_creep
+            self._dirty = True
         rec = self.spots.get(key)
         if rec is not None and not note.get("fault"):
             rec["n"] -= self.p.spot_clean_wear
@@ -465,9 +556,172 @@ class Learner:
             self._log(f"route: the GPS wanted another way at {key} (+{rise / 1000:.0f} km): that lane now costs {extra:.0f} m extra",
                       lane=key, rise_m=round(rise))
 
+    # ------------------------------------------------------------- learning from the driver
+    @staticmethod
+    def _wear(f) -> float:
+        return max((float(getattr(f, n, 0.0)) for n in ("wear_cabin", "wear_chassis", "wear_engine", "wear_transmission", "wear_wheels")),
+                   default=0.0)
+
+    def start_lesson(self, t: float, f, why: str) -> None:
+        """You have the truck now: watch how you drive it (the reason it was handed over goes with the lesson)."""
+        self.end_lesson(f)
+        self.lesson = {"t0": t, "t": t, "why": why, "m": 0.0, "wear0": self._wear(f), "samples": [], "crashed": False}
+
+    def end_lesson(self, f=None) -> int:
+        """Keep what the lesson showed. Returns the number of lanes learned."""
+        les, self.lesson = self.lesson, None
+        if les is None or self.lm is None:
+            return 0
+        p = self.p
+        if les["crashed"] or (f is not None and self._wear(f) - les["wear0"] > p.lesson_max_wear):
+            self._log(f"not learning from that: damage while you drove ({les['why']})")
+            return 0
+        samples = les["samples"]
+        stops = [m for m, _, _, v, _ in samples if v < p.lesson_stop_ms]
+        per: dict[int, dict[int, list]] = {}
+        for m, lane, b, v, lat in samples:
+            near_stop = any(-p.lesson_after_stop_m <= stop - m <= p.lesson_before_stop_m for stop in stops)
+            row = per.setdefault(lane, {}).setdefault(b, [0.0, 0, 0.0, 0])
+            if not near_stop and v >= p.lesson_min_ms:
+                row[0] += v
+                row[1] += 1
+            row[2] += lat
+            row[3] += 1
+        learned = 0
+        speeds = []
+        for lane, rows in per.items():
+            if not self._worth_a_lesson(lane):
+                continue
+            n_bins = 1 + int(self.lm.lane_length(lane) / p.lesson_bin_m)
+            new = [[None, None] for _ in range(n_bins)]
+            for b, (sv, nv, sl, nl) in rows.items():
+                if b < n_bins:
+                    new[b] = [sv / nv if nv else None, sl / nl if nl else None]
+            lats = [r[1] for r in new if r[1] is not None]
+            # your line only from a junction's path driven steadily: on a road, or swinging across, that's a lane change
+            # (seen on real drives: -3.4 m), and copying it would steer towards the next lane or a rail
+            if (self.lm.lane_kind[lane] == 0 or not lats or max(lats) - min(lats) > p.lesson_line_range_m
+                    or max(abs(x) for x in lats) > p.lesson_max_offset_m):
+                for r in new:
+                    r[1] = None
+            if not any(r[0] is not None or r[1] is not None for r in new):
+                continue
+            key = lane_key(self.lm, lane)
+            old = self.lessons.get(key)
+            if old is not None and len(old["bins"]) == n_bins:     # half what you showed before, half what you show now
+                for a, b in zip(old["bins"], new):
+                    for k in (0, 1):
+                        if a[k] is not None and b[k] is not None:
+                            b[k] = 0.5 * (a[k] + b[k])
+                        elif b[k] is None:
+                            b[k] = a[k]
+            self.lessons[key] = {"n": (old["n"] if old else 0) + 1, "why": les["why"][:60], "bins": new}
+            self._lane_rec.clear()
+            learned += 1
+            speeds += [r[0] for r in new if r[0] is not None]
+        if learned:
+            self._dirty = True
+            slow = f", down to {min(speeds) * 3.6:.0f} km/h" if speeds else ""
+            self._log(f"learned from you: {learned} lanes{slow} ({les['why'][:50]})", lanes=learned, why=les["why"])
+        return learned
+
+    def _worth_a_lesson(self, lane: int) -> bool:
+        lm = self.lm
+        if lm.lane_kind[lane] != 0:                  # KIND_ROAD is 0: anything else is a junction's path
+            return True
+        rot = np.unwrap(lm.seg_rot[lm.lane_first[lane]:lm.lane_last[lane] + 1])
+        length = float(lm.lane_length(lane))
+        return length > 0 and abs(np.diff(rot)).sum() / max(length, 1.0) >= self.p.lesson_curve
+
+    def observe_driver(self, t: float, f) -> None:
+        """A frame while you drive (not paused; ten a second is plenty)."""
+        p = self.p
+        v = float(f.speed)
+        dt = 0.0 if self._prev_t is None else t - self._prev_t
+        self._prev_t, self._prev_v_driver = t, v
+        if self.lm is None:
+            return
+        pose = pose_from_frame(f)
+        hits = self.lm.nearest(pose.x, pose.y, pose.rotation, max_dist=p.lesson_lane_m, max_heading_err=math.radians(50), k=1)
+        hit = hits[0] if hits else None
+        if self.lesson is not None:
+            les = self.lesson
+            if 0 < dt < 1.0:
+                les["m"] += abs(v) * dt
+            if hit is not None and v >= 0:
+                done = float(self.lm.seg_len[self.lm.lane_first[hit.lane]:hit.segment].sum() + hit.t * self.lm.seg_len[hit.segment])
+                les["samples"].append((les["m"], hit.lane, int(done / p.lesson_bin_m), v, hit.lateral))
+            if les["m"] >= p.lesson_m or t - les["t0"] >= p.lesson_s:
+                self.end_lesson(f)
+        self._style(t, v, f, hit)
+
+    def _style(self, t: float, v: float, f, hit) -> None:
+        """Your curve speed and acceleration pull its own values slowly your way."""
+        p = self.p
+        kappa = 0.0
+        if hit is not None:
+            lm = self.lm
+            a, b = max(hit.segment - 2, lm.lane_first[hit.lane]), min(hit.segment + 2, lm.lane_last[hit.lane])
+            if b > a:
+                turn = np.unwrap(lm.seg_rot[[a, b]])
+                kappa = abs(float(turn[1] - turn[0])) / max(float(lm.seg_len[a:b].sum()), 1.0)
+        c = self._driver_curve_state
+        if kappa > p.curve_kappa and v > p.curve_min_ms:
+            if c is None:
+                c = self._driver_curve_state = {"peak": 0.0, "wear": self._wear(f)}
+            c["peak"] = max(c["peak"], v * v * kappa)
+        elif c is not None:
+            self._driver_curve_state = None
+            if self._wear(f) - c["wear"] < 0.001 and c["peak"] > 0.5:
+                name = "lat_acc_max"
+                lo, hi = BOUNDS[name]
+                old = self.value(name, self._default(name, 2.0))
+                self._nudge(name, self._default(name, 2.0), p.style_alpha * (min(hi, max(lo, c["peak"])) - old))
+        thr = float(getattr(f, "input_throttle", 0.0))
+        d = self._driver_accel
+        if thr > 0.3 and 3.0 < v < 25.0:
+            if d is None:
+                self._driver_accel = (t, v)
+            elif t - d[0] >= p.style_accel_window_s:
+                a = (v - d[1]) / (t - d[0])
+                self._driver_accel = (t, v)
+                if 0.05 < a < 3.0:
+                    old = self.value("accel_max", self._default("accel_max", 0.7))
+                    self._nudge("accel_max", self._default("accel_max", 0.7), p.style_alpha * (a - old))
+        else:
+            self._driver_accel = None
+
+    def on_toll_paid(self, f) -> None:
+        """You paid at a booth yourself: that one takes payment, and you stopped in the right place."""
+        if self.lm is None:
+            return
+        pose = pose_from_frame(f)
+        hits = self.lm.nearest(pose.x, pose.y, pose.rotation, max_dist=self.p.lesson_lane_m, max_heading_err=math.radians(50), k=4)
+        hit = None
+        if self._rules is not None:
+            for h in hits:
+                if int(self._rules.sem_id[h.lane]) >= 0:
+                    hit = h
+                    break
+        hit = hit or (hits[0] if hits else None)
+        if hit is None:
+            return
+        key = lane_key(self.lm, hit.lane)
+        rec = self.toll_lanes.setdefault(key, {"n": 0, "back_m": None})
+        rec["n"] += 1
+        if self._gate_s is not None:
+            done = float(self.lm.seg_len[self.lm.lane_first[hit.lane]:hit.segment].sum() + hit.t * self.lm.seg_len[hit.segment])
+            back = float(self._gate_s(hit.lane, int(self.lm.lane_item[hit.lane]))) - (done + self._front_bumper)
+            if self.p.toll_back_min_m <= back <= self.p.toll_back_max_m:
+                rec["back_m"] = back if rec["back_m"] is None else 0.5 * (rec["back_m"] + back)
+        self._dirty = True
+        where = f", {rec['back_m']:.1f} m before the gate" if rec["back_m"] is not None else ""
+        self._log(f"you paid at toll booth {key}{where}: it prefers that one now", lane=key)
+
     # ------------------------------------------------------------- end of a drive
     def end_session(self) -> dict | None:
         s, p = self.s, self.p
+        self.end_lesson()
         card = None
         if s.engaged_game_km >= p.min_session_km:
             per = 100.0 / s.engaged_game_km

@@ -25,21 +25,31 @@ MEASURED = ("thr_accel", "brake_decel", "c_us")
 
 def replay(learner: Learner, path: Path) -> None:
     frame, engaged, lane = None, False, None
+    seen = 0.0
     for r in RecordingReader(path):
         if r.kind == KIND_FRAME:
             frame = r.frame()
+            if not engaged and not frame.paused and r.t - seen >= 0.1:
+                seen = r.t
+                learner.observe_driver(r.t, frame)
         elif r.kind == KIND_EVENT and frame is not None:
             ev = r.json()
             if ev.get("id") == "player.fined":
                 learner.on_fine(ev.get("attrs", {}).get("fine.offence", "?"), float(frame.speed), lane)
+            elif ev.get("id") == "player.tollgate.paid" and not engaged:
+                learner.on_toll_paid(frame)
         elif r.kind == KIND_NOTE and frame is not None:
             n = r.json()
             e = n.get("event")
             if e == "engaged":
                 engaged = True
+                learner.end_lesson(frame)
             elif e == "disengaged":
                 engaged = False
-                learner.on_handback(n.get("reason", ""), float(frame.speed), lane)
+                reason = n.get("reason", "")
+                learner.on_handback(reason, float(frame.speed), lane)
+                if not reason.startswith(("game paused", "AutoHaul stopped")):
+                    learner.start_lesson(r.t, frame, reason)
             elif e == "ap" and engaged:
                 if n.get("lane") is not None:
                     lane = n["lane"]
@@ -55,6 +65,12 @@ def report(learner: Learner) -> None:
     for k, v in sorted(hot.items(), key=lambda kv: -kv[1]["n"])[:12]:
         print(f"  {k}: {v['n']:.0f}x at {v['speed'] * 3.6:.0f} km/h ({v['why']})")
     print(f"route corrections: {len(learner.route_cost)}", dict(list(learner.route_cost.items())[:8]))
+    print(f"lessons from you: {len(learner.lessons)} lanes; toll booths: {learner.toll_lanes}")
+    for k, v in sorted(learner.lessons.items(), key=lambda kv: -kv[1]["n"])[:12]:
+        speeds = [row[0] for row in v["bins"] if row[0] is not None]
+        lats = [row[1] for row in v["bins"] if row[1] is not None]
+        print(f"  {k}: {v['n']}x, {len(v['bins'])} bins, " + (f"{min(speeds) * 3.6:.0f}-{max(speeds) * 3.6:.0f} km/h, " if speeds else "no speed, ")
+              + (f"line {min(lats):+.1f}..{max(lats):+.1f} m" if lats else "") + f" ({v['why']})")
     print("scorecards:")
     for c in learner.scorecards[-12:]:
         print(" ", c)
@@ -66,6 +82,7 @@ def main() -> int:
     ap.add_argument("--dry", action="store_true", help="don't save")
     ap.add_argument("--add", action="store_true", help="add to what's learned already")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--lessons", action="store_true", help="only add what you showed it (lessons, toll booths) to what's learned")
     args = ap.parse_args()
     cfg = load_config()
     store = cache_dir(cfg) / "learned" / "learned.json"
@@ -75,15 +92,22 @@ def main() -> int:
         return 0
     if not args.since:
         ap.error("give a date, or --report")
-    if store.exists() and not (args.add or args.dry):
+    if store.exists() and not (args.add or args.dry or args.lessons):
         print(f"{store} exists: --add to add to it")
         return 1
-    learner = Learner(None if args.dry else store, lm)
+    learner = Learner(None if args.dry or args.lessons else store, lm)
     learner.p.gps_rise_m = float("inf")      # those drives followed an older router: no route lessons from them
     for path in sorted(recordings_dir(cfg).glob("*-drive.ahrec")):
         if path.stem >= args.since and path.stat().st_size > 500_000:
             replay(learner, path)
             print(path.name, learner.end_session() or "(too short for a scorecard)")
+    if args.lessons:
+        keep = Learner(store, lm)
+        keep.lessons.update(learner.lessons)
+        keep.toll_lanes.update(learner.toll_lanes)
+        keep.save()
+        report(keep)
+        return 0
     # a recording can't show what a changed gain would have done: the nudges just pile up. Keep what it really
     # measured about the truck; the steering and braking gains are learned on the road, where each change is tried.
     for ctx in learner.values.values():
