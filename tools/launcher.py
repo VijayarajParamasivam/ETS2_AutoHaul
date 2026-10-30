@@ -209,7 +209,7 @@ class Launcher:
             return
         if not messagebox.askyesno("AutoHaul", f"Forget everything AutoHaul has learned?\n\n{folder}"):
             return
-        for name in ("learned.json", "rain.json"):
+        for name in ("learned.json",):
             (folder / name).unlink(missing_ok=True)
         self._append("[learning reset]\n")
 

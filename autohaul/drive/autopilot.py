@@ -154,6 +154,10 @@ class Autopilot:
             raise ValueError(f"unknown steering mode {steering_mode!r}")
         self.planner = SpeedPlanner(self.sp)
         self.caution = None                 # lane -> speed limit (m/s) or None: what autohaul.learn remembers
+        self.teach = None                   # how the driver drove a place (autohaul.learn.Learner.bins)
+        self.safe_stop = False              # handing over at speed: hold the lane and brake to a stop, nothing else
+        self.safe_stop_decel = 1.2          # m/s^2
+        self.safe_stop_lateral_m = 3.5      # further off than this it can't be sure of the lane: let go at once
         self.caution_ahead_m = 150.0
         self.pedals = PedalController(self.sp)
         self._lost = 0.0
@@ -237,6 +241,7 @@ class Autopilot:
         self.tracker.reset()
         self.lc = None
         self.join = None
+        self.safe_stop = False
         self.bias = self.tracker.bias = 0.0
         if self.gw:
             self.gw.reset()
@@ -335,11 +340,12 @@ class Autopilot:
         cut = r - math.sqrt(max(r * r - wb * wb, 0.0))
         return -math.copysign(min(self.p.swing_share * cut, self.p.swing_max_m), k)
 
-    def _with_trailer_swing(self, path, s0: float, base):
+    def _with_trailer_swing(self, path, s0: float, base, makes_way=None):
         """`base` offset plus the trailer swing at each point ahead (2026-10-29: in roundabouts the trailer cut
         in over the kerb while the cab followed the lane centre). Slope and curvature by finite differences."""
         def sw(ds: float) -> float:
-            return self._swing(float(path.curvature(s0 + ds)))
+            share = 1.0 - makes_way(ds) if makes_way is not None else 1.0     # the driver's line includes it
+            return self._swing(float(path.curvature(s0 + ds))) * share
 
         def offset(ds):
             y, dy, d2y = base(ds) if base is not None else (0.0, 0.0, 0.0)
@@ -347,6 +353,46 @@ class Autopilot:
             a, b, c = sw(ds - h), sw(ds), sw(ds + h)
             return y + b, dy + (c - a) / (2 * h), d2y + (c - 2 * b + a) / (h * h)
         return offset
+
+    def _taught_bins(self, st):
+        """(path arc length where it starts, bins, lane) of the lanes ahead the driver has shown how to drive."""
+        out = []
+        if self.teach is None:
+            return out
+        for lane, start in zip(self.tracker.path_lanes, self._path_starts(st)):
+            bins = self.teach.bins(lane)
+            if bins:
+                out.append((start, bins, lane))
+        return out
+
+    def _taught_line(self, taught, path, s0: float):
+        """The driver's line as offsets (y, dy, d2y at ds ahead of the truck, + = right) and how much it applies there
+        (0..1, where the trailer swing makes way for it). Smoothed, so it eases in and out over ~20 m."""
+        step = 2.5
+        grid = np.arange(-15.0, max(path.length - s0, 0.0) + step, step)
+        y, mask = np.zeros(len(grid)), np.zeros(len(grid))
+        bin_m = 5.0
+        for start, bins, _lane in taught:
+            idx = np.floor((s0 + grid - start) / bin_m).astype(int)
+            for i in np.flatnonzero((idx >= 0) & (idx < len(bins))).tolist():
+                lat = bins[idx[i]][1]
+                if lat is not None:
+                    y[i] = max(-1.5, min(1.5, lat))
+                    mask[i] = 1.0
+        if not mask.any():
+            return None, None
+        kernel = np.ones(9) / 9.0
+        y = np.convolve(np.pad(y, 4, mode="edge"), kernel, mode="valid")
+        mask = np.convolve(np.pad(mask, 4, mode="edge"), kernel, mode="valid")
+        dy = np.gradient(y, step)
+        d2y = np.gradient(dy, step)
+
+        def line(ds):
+            return float(np.interp(ds, grid, y)), float(np.interp(ds, grid, dy)), float(np.interp(ds, grid, d2y))
+
+        def applies(ds):
+            return float(np.interp(ds, grid, mask))
+        return line, applies
 
     def _changes_allowed(self) -> bool:
         """Automatic lane changes only where the map's lanes match the road (a big kept offset says they don't:
@@ -670,10 +716,13 @@ class Autopilot:
             out.press = list(gw.press)
             if out.indicator is None and self.lc is None:
                 out.indicator = self._turn_signal(st, max(frame.speed, 0.0))
-        if self.route is not None and out.on_route and not out.fault:
-            out.fault = self._route_checks(st, max(frame.speed, 0.0), out)
-        if not out.fault and (self.lc is not None or self.route is not None):
-            out.fault = self._lane_change_step(st, pose, traffic, out)
+        if self.safe_stop:                          # only the lane and the brake now: nothing else can hand back
+            out.fault, out.press, out.indicator, self.lc = None, [], None, None
+        else:
+            if self.route is not None and out.on_route and not out.fault:
+                out.fault = self._route_checks(st, max(frame.speed, 0.0), out)
+            if not out.fault and (self.lc is not None or self.route is not None):
+                out.fault = self._lane_change_step(st, pose, traffic, out)
         if out.fault and self.lc is not None:
             self.lc = None                          # handing back: AutoHaul stops signalling
         t2 = clock()
@@ -692,12 +741,25 @@ class Autopilot:
         elif bias:
             offset = lambda ds: (bias, 0.0, 0.0)                      # noqa: E731
         swing_now = 0.0
+        taught = self._taught_bins(st) if self.lc is None else []
+        line, makes_way = self._taught_line(taught, path, s_truck) if taught else (None, None)
+        taught_now = 0.0
+        if line is not None:
+            taught_now = line(0.0)[0]
+            before = offset
+
+            def offset(ds):                         # noqa: F811 (the driver's line on top of what's there)
+                y, dy, d2y = before(ds) if before is not None else (0.0, 0.0, 0.0)
+                ty, tdy, td2y = line(ds)
+                return y + ty, dy + tdy, d2y + td2y
+            off_ref -= taught_now                   # meant: not an error
+            out.lateral = off_ref
         if self._trailer and self.p.trailer_swing:
-            offset = self._with_trailer_swing(path, s_truck, offset)
-            swing_now = self._swing(float(path.curvature(s_truck)))
+            offset = self._with_trailer_swing(path, s_truck, offset, makes_way)
+            swing_now = self._swing(float(path.curvature(s_truck))) * (1.0 - (makes_way(0.0) if makes_way else 0.0))
             off_ref -= swing_now                    # the swing is meant: not an error
             out.lateral = off_ref
-        self.tracker.bias = self.bias + swing_now   # the lane match expects the truck there
+        self.tracker.bias = self.bias + swing_now + taught_now   # the lane match expects the truck there
         lat = self.lat.step(pose, path, dt, measured_steer_left(frame, self.geom), steer_rate=rate, offset=offset)
         out.ctrl_lateral, out.kappa_ff, out.curve_ratio = lat.lateral, lat.kappa_ff, lat.ratio
         target = max(-self.p.max_steer_units, min(self.p.max_steer_units, lat.steer_left / self.geom.rad_per_unit))
@@ -710,13 +772,13 @@ class Autopilot:
             out.servo_gain = getattr(self.servo, "gain", 0.0)
             if out.fault:
                 pass
-            elif abs(off_ref) > self.p.max_lateral_m:
+            elif abs(off_ref) > (self.safe_stop_lateral_m if self.safe_stop else self.p.max_lateral_m):
                 out.fault = f"{abs(off_ref):.1f} m off the {'lane-change line' if moving_now else 'lane centre'}"
-            elif self._low_conf > self.p.low_confidence_s:
+            elif self._low_conf > self.p.low_confidence_s and not self.safe_stop:
                 out.fault = f"lane match uncertain for {self._low_conf:.1f} s"
             elif self.servo.fighting:
                 out.fault = "the wheel is moving against AutoHaul's steering (someone else steering?)"
-            else:
+            elif not self.safe_stop:
                 # Phase 2 keeps lanes; junction turns need the route (Phase 3). Hand back early enough
                 # to react when the path ahead turns sharper than a highway ramp.
                 s0 = lat.s_rear + self.geom.rear_axle
@@ -727,7 +789,8 @@ class Autopilot:
                     i = int(np.argmax(k))
                     r_route = self.p.route_min_turn_radius_trailer_m if self._trailer else self.p.route_min_turn_radius_m
                     r_min = r_route if out.on_route else self.p.min_turn_radius_m
-                    if k[i] > 1.0 / r_min:
+                    shown = any(start <= ss[i] <= start + 5.0 * len(bins) for start, bins, _ in taught)
+                    if k[i] > 1.0 / r_min and not shown:     # (one the driver has shown it: it takes it as they did)
                         out.fault = f"sharp turn ahead (radius {1 / k[i]:.0f} m in {ss[i] - s0:.0f} m): take over"
         t3 = clock()
 
@@ -741,6 +804,11 @@ class Autopilot:
             if path.length - self.tracker.path_back < self.p.path_ahead_m - 1:
                 stop_at = max(path.length - self.geom.front_bumper - self.p.lane_end_margin_m, s0)
             points = []
+            for start, bins, _lane in taught:       # as fast as the driver took it, braking in time
+                for i, row in enumerate(bins):
+                    at = start + (i + 0.5) * 5.0
+                    if row[0] is not None and at > s0:
+                        points.append((at, max(5.0, 1.05 * row[0]), "taught"))
             if gw is not None:
                 # give-way points are for the front bumper; the planner works at the truck's origin (s0)
                 back = s_truck + self.geom.front_bumper - s0
@@ -785,6 +853,7 @@ class Autopilot:
                           "turn": f"junction turn in {d_ahead:.0f} m" if d_ahead > 0.5 else "junction turn",
                           "junction": f"{gw.note if gw else 'junction'} ({d_ahead:.0f} m)",
                           "queue": f"queueing ({d_ahead:.0f} m)",
+                          "taught": f"as you took it, in {d_ahead:.0f} m",
                           "stop": f"stopping in {d_ahead:.0f} m" if d_ahead > 0.5 else "stopped at the destination"}.get(
                               kind, f"mapped lane ends in {d_ahead:.0f} m")
             a_req = self.sp.k_speed * (target_v - v)
@@ -795,9 +864,16 @@ class Autopilot:
                 a_acc, emergency = acc_accel(lead, v, self.sp)
                 if a_acc < a_req:
                     a_req, reason = a_acc, f"following at {lead.gap:.0f} m"
+            if self.safe_stop:
+                a_req = min(a_req, -self.safe_stop_decel)
+                target_v, reason = min(target_v, v), "stopping: take over"
             out.lead, out.emergency = lead, emergency
             out.limit_kmh, out.target_kmh, out.target_reason, out.a_request = limit * 3.6, target_v * 3.6, reason, a_req
             cmd.throttle, cmd.brake = self.pedals.step(a_req, v, dt, emergency, v_cap=target_v)
+            if self.safe_stop:
+                cmd.throttle = 0.0
+                if v < 0.5:
+                    cmd.brake = max(cmd.brake, 0.5)  # standing: it stays there until the driver takes over
             out.throttle, out.brake = cmd.throttle, cmd.brake
             # the game must actually take the pedals we sent last frame (it silently ignores them while
             # AutoHaul's steering axis is held non-zero, and controller mixes can cancel them)

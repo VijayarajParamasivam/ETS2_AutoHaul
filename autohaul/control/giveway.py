@@ -137,6 +137,7 @@ class GiveWay:
         self._wait = 0.0
         self.lights: LightReader | None = None
         self.tolls = False                         # handle toll gates (pay with activate) instead of handing back
+        self.toll_back = None                      # lane -> where the driver stopped at this booth (m before it), or None
         self._toll: dict[int, dict] = {}           # junction -> toll gate progress
         self._dark: set[int] = set()               # junctions whose light shows no lamp: give way to everyone
         self._item_lanes: dict[int, np.ndarray] = {}
@@ -250,7 +251,8 @@ class GiveWay:
                    out: GiveWayResult, blocked: list) -> None:
         p = self.p
         gs = self._toll.setdefault(item, {"phase": "approach", "stood": 0.0, "since": 1e9, "presses": 0, "t": 0.0})
-        stop = s_lane + self._gate_s(lane, item) - p.toll_back_m
+        back = self.toll_back(lane) if self.toll_back is not None else None
+        stop = s_lane + self._gate_s(lane, item) - (p.toll_back_m if back is None else back)
         if gs["phase"] in ("approach", "paying"):
             out.points.append((stop - 40.0, p.toll_approach_kmh / 3.6, "toll gate"))
             if self._paid and gs["presses"]:

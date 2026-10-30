@@ -61,4 +61,4 @@ Press **Start**, click the game, and press `/` to engage. Press `/` again (or an
 
 **Learning** (`autohaul/learn`, "Learn while driving"): AutoHaul adjusts its curve speed, steering balance, correction strength, braking and pedal values to the truck, per truck state, in small steps inside hard bounds. It slows down at places where you've had to take over, corrects its routes where the game's GPS disagrees, and goes back to earlier values if drives get clearly worse. Every change and its reason is in `learned/learning.jsonl` under the cache folder; `tools/learn_replay.py --report` shows what it knows; "Reset learning" forgets it. See [docs/LEARNING.md](docs/LEARNING.md).
 
-**Wipers**: telemetry has no rain signal, so AutoHaul learns what rain looks like from the times you switch the wipers on yourself. It doesn't touch them until it has seen enough rain.
+**Wipers and headlights**: while AutoHaul drives, the wipers follow the rain the game records in its autosaves (so up to 5 minutes late), and the low beam is on from 20:00 to 07:00 game time and off by day. After you switch either yourself, AutoHaul leaves it alone for a while.

@@ -15,7 +15,8 @@ from autohaul.control.speed import SpeedParams
 from autohaul.control.steering import LateralController
 from autohaul.control.vehicle import TruckGeometry
 from autohaul.drive.autopilot import Autopilot
-from autohaul.drive.wipers import RainModel, WiperControl, WiperParams, picture_features
+from autohaul.drive.wipers import WeatherWatch, WiperControl, WiperParams, rain_now
+from autohaul.infra.saves import Weather, parse_weather
 from autohaul.infra.overlay_feed import OverlayFeed, explain, why_speed
 from autohaul.learn.learner import BOUNDS, Learner, LearnParams, lane_key
 from autohaul.mission.manager import MissionStatus
@@ -298,66 +299,87 @@ def test_a_scorecard_per_drive_and_rollback_when_drives_get_worse():
 
 
 # ------------------------------------------------------------------ wipers
-def _pic(rain: bool, rng) -> np.ndarray:
-    img = np.zeros((200, 300, 3), np.uint8)
-    if rain:
-        img[:] = 110
-        img = (img + rng.integers(0, 30, img.shape)).astype(np.uint8)
-    else:
-        img[..., 0], img[..., 1], img[..., 2] = 230, 170, 110      # blue sky
-    return img
+def _w(current, wetness, saved_at):
+    return Weather(current, wetness, saved_at)
 
 
-def test_rain_model_learns_from_labels():
-    rng = np.random.default_rng(1)
-    m = RainModel()
-    for i in range(1500):
-        rain = i % 10 == 0
-        m.learn(picture_features(_pic(rain, rng)), rain)
-    assert m.p(picture_features(_pic(True, rng))) > 0.8
-    assert m.p(picture_features(_pic(False, rng))) < 0.2
-    assert RainModel.from_dict(json.loads(json.dumps(m.to_dict()))).n == m.n
+def test_rain_is_read_from_how_wet_the_saves_say_it_is():
+    """The saves of 2026-10-30, as a shower began."""
+    assert rain_now(None, _w(0, 0.0, 1)) is False
+    assert rain_now(_w(0, 0.0, 1), _w(0, 0.0, 2)) is False
+    assert rain_now(_w(0, 0.0, 2), _w(0, 0.051, 3)) is True   # it started before the weather field says so
+    assert rain_now(_w(0, 0.051, 3), _w(1, 0.522, 4)) is True
+    assert rain_now(_w(1, 1.0, 5), _w(1, 1.0, 6)) is True     # soaked, and still raining
+    assert rain_now(_w(1, 1.0, 6), _w(0, 0.7, 7)) is False    # drying
+    assert rain_now(None, _w(1, 0.0, 1)) is False             # (after a job: says rain, nothing's wet)
+    assert rain_now(None, _w(1, 0.4, 1)) is True
 
 
-def test_wipers_wait_until_they_know_rain_then_follow_it_and_respect_the_driver():
-    rng = np.random.default_rng(2)
+def test_a_save_field_parses():
+    text = "\n stored_weather_change_timer: &40eaac4a\n stored_current_weather: 1\n stored_rain_wetness: &3f05acef\n"
+    w = parse_weather(text, 5.0)
+    assert w.current == 1 and w.wetness == pytest.approx(0.522, abs=0.001) and w.saved_at == 5.0
+    assert parse_weather("nothing here") is None
+
+
+def test_weather_watch_uses_each_new_save_once_and_forgets_old_news():
+    now = [1000.0]
+    saves_seen = [_w(0, 0.0, 900.0)]
+    watch = WeatherWatch(lambda: saves_seen[-1], clock=lambda: now[0])
+    assert watch.raining is None
+    watch.poll()
+    assert watch.raining is False and "dry" in watch.describe()
+    saves_seen.append(_w(0, 0.05, 1200.0))
+    now[0] = 1210.0
+    watch.poll()
+    assert watch.raining is True and "raining" in watch.describe()
+    watch.poll()                                              # the same save again: nothing new
+    assert watch.raining is True
+    now[0] = 1900.0
+    assert watch.raining is None                              # too old to say
+
+
+def test_weather_watch_survives_a_save_being_written():
+    def broken():
+        raise ValueError("half a file")
+
+    watch = WeatherWatch(broken)
+    watch.poll()
+    assert watch.raining is None
+
+
+def test_wipers_follow_the_rain_and_respect_the_driver():
     pressed = []
-    w = WiperControl(pressed.append, None, WiperParams(min_rain_s=60.0, min_clear_s=120.0, on_after_s=5.0, off_after_s=5.0,
-                                                       driver_hold_s=30.0))
-    t, on = 0.0, False
-    assert "learning" in w.describe()
-    for _ in range(200):                                       # clear, wipers off
-        w.step(on, picture_features(_pic(False, rng)), t, 1.0, True)
-        t += 1.0
-    for _ in range(40):                                        # raining, wipers off: not known yet, so nothing happens
-        w.step(on, picture_features(_pic(True, rng)), t, 1.0, True)
-        t += 1.0
-    assert pressed == [] and not w.ready
-    on = True                                                  # you switch them on
-    for _ in range(100):
-        w.step(on, picture_features(_pic(True, rng)), t, 1.0, True)
-        t += 1.0
-    assert pressed == [] and w.ready
-    on = False                                                 # you switch them off: left alone for driver_hold_s ...
-    w.step(on, picture_features(_pic(False, rng)), t, 1.0, True)
-    for _ in range(20):
-        t += 1.0
-        w.step(on, picture_features(_pic(False, rng)), t, 1.0, True)
-    assert pressed == []
-    t += 40.0
-    for _ in range(60):                                        # ... and now rain: AutoHaul switches them on itself
-        t += 1.0
-        w.step(on, picture_features(_pic(True, rng)), t, 1.0, True)
-        if pressed:
-            on = True
-            break
-    assert pressed == ["wipers"]
-    for _ in range(40):
-        t += 1.0
-        w.step(on, picture_features(_pic(False, rng)), t, 1.0, True)
-        if len(pressed) == 2:
-            on = False
-    assert pressed == ["wipers", "wipersback"]
+    w = WiperControl(pressed.append, WiperParams(driver_hold_s=30.0))
+    w.step(True, None, 0.0, True)
+    assert pressed == []                                      # not known: leave them
+    w.step(True, False, 10.0, False)
+    assert pressed == []                                      # not driving: they're yours
+    w.step(True, False, 20.0, True)                           # left on, and it's dry: the complaint of 2026-10-30
+    assert pressed == ["wipersback"]
+    w.step(True, False, 20.5, True)
+    assert pressed == ["wipersback"]                          # one at a time
+    w.step(True, False, 22.0, True)                           # from the top stage it takes a few
+    assert pressed == ["wipersback", "wipersback"]
+    w.step(False, False, 23.0, True)
+    assert len(pressed) == 2                                  # off
+    w.step(False, True, 30.0, True)                           # it rains
+    assert pressed[-1] == "wipers"
+    w.step(True, True, 31.0, True)
+    assert len(pressed) == 3
+    w.step(False, True, 40.0, True)                           # you switched them off, in the rain
+    w.step(False, True, 41.0, True)
+    assert len(pressed) == 3                                  # left alone ...
+    w.step(False, True, 71.0, True)
+    assert pressed[-1] == "wipers" and len(pressed) == 4      # ... for a while
+
+
+def test_wipers_give_up_if_the_button_does_nothing():
+    pressed = []
+    w = WiperControl(pressed.append)
+    for i in range(30):
+        w.step(True, False, float(i * 2), True)
+    assert len(pressed) == 5
 
 
 # ------------------------------------------------------------------ overlay
@@ -369,10 +391,10 @@ def test_overlay_explains_reads_decisions_and_reasons():
                 route_km=6.3, on_route=True, lane_change="left: signalling (needed within 400 m)", indicator="left",
                 steer_target=-0.2)
     ms = MissionStatus(state="to destination", job="bars: a -> b", next_stop="fuel at Lyon", decision="fuel runs out before b")
-    d = explain(f, st, ms, "ENGAGED", True, 900.0, {"rain": "learning", "learned": ["Curves: 2.0"]})
+    d = explain(f, st, ms, "ENGAGED", True, 900.0, {"rain": "dry", "learned": ["Curves: 2.0"]})
     reads = dict(map(tuple, d["reads"]))
     assert reads["Speed"].startswith("72 km/h") and "limit 90" in reads["Speed"]
-    assert "20 %" in reads["Fuel"] and "GPS 120 km" in reads["Distance"] and reads["Rain"] == "learning"
+    assert "20 %" in reads["Fuel"] and "GPS 120 km" in reads["Distance"] and reads["Rain"] == "dry"
     doing = dict(map(tuple, d["doing"]))
     assert doing["Target"].startswith("45 km/h") and doing["Steering"].startswith("right") and doing["Next stop"] == "fuel at Lyon"
     assert any("curve 60 m ahead" in w for w in d["why"])

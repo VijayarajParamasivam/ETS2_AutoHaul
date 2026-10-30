@@ -87,6 +87,32 @@ def job_trailer(profile_dir: Path | None) -> TrailerPose | None:
     return parse_trailer(text, path.stat().st_mtime)
 
 
+@dataclass
+class Weather:
+    current: int            # stored_current_weather
+    wetness: float          # stored_rain_wetness: rises in the rain, falls as it dries
+    saved_at: float
+
+
+def parse_weather(text: str, saved_at: float = 0.0) -> Weather | None:
+    wet = re.search(r"\n stored_rain_wetness: (\S+)", text)
+    cur = re.search(r"\n stored_current_weather: (\S+)", text)
+    if not wet or not cur:
+        return None
+    return Weather(int(cur.group(1)), _num(wet.group(1)), saved_at)
+
+
+def weather(profile_dir: Path | None) -> Weather | None:
+    """The weather in the newest autosave (the game writes one every 5 minutes), or None."""
+    if profile_dir is None:
+        return None
+    files = list((Path(profile_dir) / "save").glob("autosave*/game.sii"))
+    if not files:
+        return None
+    path = max(files, key=lambda f: f.stat().st_mtime)
+    return parse_weather(decrypt(path.read_bytes()).decode("utf-8", errors="replace"), path.stat().st_mtime)
+
+
 def kingpin(t: TrailerPose, ahead_m: float) -> tuple[float, float]:
     """The kingpin: `ahead_m` in front of the trailer's origin (5 m on a 1.53 box trailer)."""
     return t.x + ahead_m * math.cos(t.rotation), t.y + ahead_m * math.sin(t.rotation)
