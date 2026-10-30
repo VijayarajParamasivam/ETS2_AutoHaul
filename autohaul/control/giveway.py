@@ -61,7 +61,9 @@ class GiveWayParams:
     own_accel: float = 0.5              # m/s^2, the truck pulling away
     junction_speed: float = 20 / 3.6    # m/s, the truck's speed through the junction (for its clearing time)
     approach_kmh: float = 15.0          # speed at a give-way line, so the truck can still stop
-    inside_kmh: float = 20.0            # top speed inside an intersection (tight, overlapping junction curves)
+    inside_kmh: float = 20.0            # top speed where paths conflict inside an intersection (or under a signal)
+    conflict_before_m: float = 30.0     # ... from this far before the conflict point ...
+    conflict_after_m: float = 10.0      # ... to this far past it
     inside_lat_acc: float = 1.4         # m/s^2 in intersection turns: the wheel (relative steering) turns slowly,
                                         # and a town turn must be wound in and out within a few metres
     max_decel: float = 3.5              # m/s^2, the hardest braking a give-way stop may use
@@ -136,6 +138,7 @@ class GiveWay:
         self._stopped: dict[int, float] = {}      # junction -> seconds stood still at its stop line
         self._wait = 0.0
         self.lights: LightReader | None = None
+        self._spans: dict[int, list] = {}
         self.tolls = False                         # handle toll gates (pay with activate) instead of handing back
         self.toll_back = None                      # lane -> where the driver stopped at this booth (m before it), or None
         self._toll: dict[int, dict] = {}           # junction -> toll gate progress
@@ -190,6 +193,21 @@ class GiveWay:
             # road piece: those count too (2026-10-29: AutoHaul drove into a toll booth lane at 25 km/h)
             if self.j.is_intersection(item) or int(self.rules.sem_id[lane]) >= 0 or self.rules.toll_plaza(item):
                 yield k, lane, item
+
+    def _slow_spans(self, lane: int) -> list[tuple[float, float]]:
+        """Where along this junction path the junction's slow speed applies (metres from its start): around its real
+        conflicts with other paths, or all of it under a signal. Not the rest of a big interchange: straight over a
+        bridge, or under one, nothing crosses at that height, and it crawled along at 20 km/h for a third of a drive
+        (2026-10-30; a path could be 599 m long)."""
+        spans = self._spans.get(lane)
+        if spans is None:
+            p = self.p
+            if int(self.rules.sem_id[lane]) >= 0:
+                spans = [(0.0, float(self.g.length[lane]))]
+            else:
+                spans = [(c.s_mine - p.conflict_before_m, c.s_mine + p.conflict_after_m) for c in self.j.conflicts(lane)]
+            self._spans[lane] = spans
+        return spans
 
     def light(self, lane: int, item: int) -> bool:
         """A visible traffic light controls the path (virtual lights only steer the AI: plain give way)."""
@@ -330,8 +348,10 @@ class GiveWay:
             line_stop = line - p.line_back_m
             end = s_start[k + 1] if k + 1 < len(s_start) else s_start[k] + float(self.g.length[lane])
             if item not in plazas:                  # a toll plaza's fanning lanes: the booth sets the speed
+                spans = self._slow_spans(lane)
                 for at in np.arange(max(s_start[k], s_front), end + 0.1, 4.0):
-                    out.points.append((float(at), p.inside_kmh / 3.6, "intersection"))
+                    if any(a <= at - s_start[k] <= b for a, b in spans):
+                        out.points.append((float(at), p.inside_kmh / 3.6, "intersection"))
             mine = self.rules.priority(lane)
             if self.tolls and self.rules.control(lane, item) == "toll gate":
                 self._toll_gate(lane, item, s_start[k], s_front, v, dt, out, blocked)

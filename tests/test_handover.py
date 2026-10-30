@@ -391,3 +391,143 @@ def test_your_curve_speed_and_acceleration_pull_its_values_your_way():
         lr.observe_driver(t, f)
         t, v = t + 0.1, v + 0.1                               # 1 m/s^2
     assert sp.accel_max > accel_before
+
+
+
+# ------------------------------------------------------------------ the ride of 2026-10-30
+def _join(back=0.0, side=0.0, gap=0.0):
+    """A straight road (0), then a curve of radius 40 m (1) starting `back` behind / `gap` ahead of its end, `side` aside."""
+    a = arc_polyline([(300, 0.0)])
+    curve = arc_polyline([(60, 1 / 40)], x=300 - back + gap, y=side)
+    end, rot = curve[-1], math.atan2(curve[-1, 1] - curve[-2, 1], curve[-1, 0] - curve[-2, 0])
+    b = arc_polyline([(300, 0.0)], x=end[0], y=end[1], rot=rot)
+    return build([(a, KIND_PREFAB, 1, 0), (curve, KIND_PREFAB, 1, 1), (b, KIND_ROAD, 3, 1)])
+
+
+@pytest.mark.parametrize("back,side", [(1.1, 0.3), (2.0, 0.0), (0.5, 0.5), (1.5, -0.8)])
+def test_a_join_that_steps_back_isnt_a_hairpin(back, side):
+    """2026-10-30: a path starting 1.1 m behind the last one's end and 0.3 m aside. The stitched path went forward, jumped
+    back, then turned: curvature -0.21, +0.11, -0.08 on a curve of radius 12 m, read as "sharp turn ahead"."""
+    from autohaul.control.path import PathRef
+    lm = _join(back=back, side=side)
+    ap, sim = _ap(lm, x=200.0, speed=12.0)
+    cmd, st = ap.step(sim.frame(25.0), [], sim.p.dt)
+    assert not st.fault, st.fault
+    pts = ap.tracker.path_ahead(180.0)
+    d = np.diff(pts, axis=0)
+    d = d[np.hypot(d[:, 0], d[:, 1]) > 0.01]                  # (the truck's own point starts it twice)
+    u = d / np.hypot(d[:, 0], d[:, 1])[:, None]
+    assert (np.einsum("ij,ij->i", u[:-1], u[1:]) > 0.5).all()    # never turns back on itself
+    path = PathRef(pts)
+    k = np.abs(np.asarray(path.curvature(np.arange(0.0, path.length, 2.0), 6.0)))
+    assert k.max() < 1 / 12.0, 1 / k.max()                    # the radius 40 m curve doesn't read as a tight one
+
+
+def test_a_real_gap_ahead_is_still_bridged():
+    lm = _join(gap=2.0)
+    ap, sim = _ap(lm, x=200.0, speed=12.0)
+    ap.step(sim.frame(25.0), [], sim.p.dt)
+    pts = ap.tracker.path_ahead(180.0)
+    assert any(np.hypot(*(p - np.array([302.0, 0.0]))) < 0.01 for p in pts)
+    assert ap.tracker.path_lanes[:2] == [0, 1]
+
+
+def test_a_truck_drives_a_stepped_back_join_without_fuss():
+    lm = _join(back=1.1, side=0.3)
+    ap, sim = _ap(lm, x=200.0, speed=12.0)
+    worst = 0.0
+    for _ in range(int(22 / sim.p.dt)):
+        cmd, st = ap.step(sim.frame(25.0), [], sim.p.dt)
+        assert not st.fault, st.fault
+        worst = max(worst, abs(st.lateral))
+        sim.step(cmd.steer, cmd.throttle, cmd.brake)
+    assert worst < 1.0 and st.lane == 2
+
+
+@pytest.mark.parametrize("radius", [6.0, 8.0, 12.0])
+def test_it_drives_through_tight_turns_on_a_route(radius):
+    lm = _course(radius=radius, curve_m=radius * 1.5)         # about 85 degrees
+    ap, sim = _ap(lm, x=240.0, speed=10.0)
+    worst = 0.0
+    passed = False
+    for _ in range(int(35 / sim.p.dt)):
+        cmd, st = ap.step(sim.frame(25.0), [], sim.p.dt)
+        assert not st.fault, st.fault
+        worst = max(worst, abs(st.lateral))
+        passed |= st.lane == 2
+        sim.step(cmd.steer, cmd.throttle, cmd.brake)
+    assert passed and worst < 1.6
+
+
+def test_a_jump_in_the_map_isnt_leaving_the_lane():
+    """2026-10-30: -0.39 to -1.5 m within 0.2 s, at walking pace, where two junction paths don't line up."""
+    lm = _course()
+    ap, _ = _ap(lm)
+    assert not ap._off_lane(1.7, 2.0, 0.1)                    # slow: it may be the map
+    for _ in range(8):
+        assert not ap._off_lane(1.7, 2.0, 0.1)
+    assert ap._off_lane(1.7, 2.0, 0.2)                        # still off after a second: it's the truck
+    ap._off_for = 0.0
+    assert not ap._off_lane(1.7, 20.0, 0.1)
+    assert ap._off_lane(1.7, 20.0, 0.1)                       # at speed: at once, nearly
+    ap._off_for = 0.0
+    assert ap._off_lane(3.6, 2.0, 0.01)                       # far off: at once
+    ap._off_for = 0.0
+    ap._off_lane(1.7, 2.0, 0.5)
+    assert not ap._off_lane(0.2, 2.0, 0.5) and ap._off_for == 0.0
+
+
+def test_the_straight_way_over_the_bridge_beats_the_ramp_down_and_up():
+    """From an exit-only lane: changing lanes (80 m) to go straight over, or down the ramp, through the junction at the
+    bottom and back up, hardly longer. It took the ramp, at about 20 km/h, for over a minute, twice."""
+    left, right = arc_polyline([(300, 0.0)], x=0, y=0), arc_polyline([(300, 0.0)], x=0, y=4.5)
+    over = arc_polyline([(120, 0.0)], x=300, y=0)
+    ramp = np.column_stack([np.linspace(300, 420, 25), 4.5 + 6.0 * np.sin(np.linspace(0, math.pi, 25))])
+    on_left = arc_polyline([(300, 0.0)], x=420, y=0)
+    on_right = arc_polyline([(300, 0.0)], x=420, y=4.5)
+    lm = build([(left, KIND_ROAD, 1, 1), (right, KIND_ROAD, 1, 2), (over, KIND_PREFAB, 7, 0), (ramp, KIND_PREFAB, 7, 1),
+                (on_left, KIND_ROAD, 9, 1), (on_right, KIND_ROAD, 9, 2)])
+    n = lm.lane_last[3] - lm.lane_first[3] + 1
+    i = lm.lane_first[3]
+    z = 9.0 * np.abs(np.linspace(-1, 1, n + 1))               # down 9 m, and up again
+    lm.seg[i:i + n, 4], lm.seg[i:i + n, 5] = z[:-1], z[1:]
+    g = LaneGraph.build(lm, log=lambda *_: None)
+    target = tuple(lm.lane_points(5)[-1])
+    flat = Router(lm, g, climb_m_per_m=0.0).route(1, 10.0, target, goal=(5, 290.0))
+    assert 3 in flat.lanes                                    # what it did
+    r = Router(lm, g)
+    way = r.route(1, 10.0, target, goal=(5, 290.0))
+    assert 3 not in way.lanes and 2 in way.lanes, way.lanes   # over the bridge
+    assert sum(way.changes) >= 1
+    alone = Router(lm, g).route(1, 10.0, target, goal=(5, 290.0), no_change_m=1e9)
+    assert alone is not None and 3 in alone.lanes             # with no room to change, the ramp is still a way on
+
+
+def _gw_for_spans(lm, sem_lane=None):
+    from autohaul.control.giveway import GiveWay
+    from autohaul.world.junctions import Junctions
+    gw = GiveWay.__new__(GiveWay)
+    gw.p = SimpleNamespace(conflict_before_m=30.0, conflict_after_m=10.0)
+    gw.j = Junctions(lm)
+    gw.g = LaneGraph.build(lm, log=lambda *_: None)
+    sem = np.full(len(lm.lane_kind), -1)
+    if sem_lane is not None:
+        sem[sem_lane] = 0
+    gw.rules = SimpleNamespace(sem_id=sem)
+    gw._spans = {}
+    return gw
+
+
+def test_only_real_conflicts_slow_a_junction_path():
+    """Straight over a bridge in a junction that has a crossroads somewhere: it crawled at 20 km/h for a third of a drive."""
+    crossing_a = arc_polyline([(200, 0.0)], x=0, y=0)
+    crossing_b = arc_polyline([(80, 0.0)], x=100, y=-40, rot=math.pi / 2)
+    elsewhere = arc_polyline([(500, 0.0)], x=0, y=300)
+    lm = build([(crossing_a, KIND_PREFAB, 7, 0), (crossing_b, KIND_PREFAB, 7, 1), (elsewhere, KIND_PREFAB, 7, 2)])
+    gw = _gw_for_spans(lm)
+    assert gw.j.is_intersection(7) is True
+    assert gw._slow_spans(2) == []                            # a junction with a crossing, but not on this path
+    spans = gw._slow_spans(0)
+    assert len(spans) == 1 and spans[0] == pytest.approx((70.0, 110.0), abs=2.0)   # around the crossing, not all 200 m
+    gw = _gw_for_spans(lm, sem_lane=2)
+    assert gw._slow_spans(2) == [(0.0, pytest.approx(500.0, abs=2.0))]   # under a signal: all of it

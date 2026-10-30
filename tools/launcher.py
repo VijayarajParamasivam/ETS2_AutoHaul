@@ -23,6 +23,11 @@ from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from autohaul.infra.config import load_config  # noqa: E402
+from autohaul.infra.paths import map_dir  # noqa: E402
+from autohaul.world.place_search import Option, PlaceIndex, exact, search  # noqa: E402
+
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 SETTINGS = ROOT / "logs" / "launcher.json"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -33,7 +38,7 @@ MODES = [
     ("mission", "Job (full mission)",
      "Runs the active job: to the trailer, couples it, to the destination, quick park; fuel and rest stops."),
     ("to", "Drive to a place",
-     "Follows the route to a city or company you type below (no job needed)."),
+     "Follows the route to the city or company you choose below (no job needed)."),
     ("road", "Follow the road",
      "Lane keeping and speed, no route: hands back before junctions it can't decide."),
     ("steer", "Steer only",
@@ -53,6 +58,144 @@ def drive_args(mode: str, place: str, max_kmh: int, record: bool, learn: bool = 
     if not learn:
         args.append("--no-learning")
     return args + ["--stdin-quit"]
+
+
+def place_spec(city: Option | None, company: Option | None) -> str:
+    """drive.py's --to for a choice: CITY:COMPANY (that depot), CITY (its centre)."""
+    if city is None:
+        return ""
+    return f"{city.token}:{company.token}" if company is not None else city.token
+
+
+class SuggestEntry(ttk.Frame):
+    """A text box that suggests as you type. Up and down move through the list, Enter or Tab or a click takes one, Esc
+    closes it. `options()` gives what it can suggest."""
+
+    MAX_ROWS = 8
+
+    def __init__(self, parent, options, width: int = 32, on_change=None, on_pick=None, open_on_focus: bool = False):
+        super().__init__(parent)
+        self.options, self.on_change, self.on_pick = options, on_change, on_pick
+        self.open_on_focus = open_on_focus
+        self.text = tk.StringVar()
+        self.entry = ttk.Entry(self, textvariable=self.text, width=width)
+        self.entry.pack(fill="x")
+        self.popup: tk.Toplevel | None = None
+        self.listbox: tk.Listbox | None = None
+        self.shown: list[Option] = []
+        self.picked: Option | None = None
+        self.entry.bind("<KeyRelease>", self._typed)
+        self.entry.bind("<Down>", lambda e: self._move(1))
+        self.entry.bind("<Up>", lambda e: self._move(-1))
+        self.entry.bind("<Return>", self._accept)
+        self.entry.bind("<Tab>", self._accept_tab)
+        self.entry.bind("<Escape>", lambda e: self.close())
+        self.entry.bind("<FocusIn>", self._focused)
+        self.entry.bind("<FocusOut>", lambda e: self.after(150, self._maybe_close))
+
+    def set(self, option: Option | None) -> None:
+        self.picked = option
+        self.text.set(option.label if option else "")
+
+    def choice(self) -> Option | None:
+        """What the box says, if it names one of the options."""
+        return exact(self.text.get(), self.options())
+
+    def enable(self, on: bool) -> None:
+        self.entry.configure(state="normal" if on else "disabled")
+        if not on:
+            self.close()
+
+    # ------------------------------------------------------------- the list
+    def _typed(self, event) -> None:
+        if event.keysym in ("Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Left", "Right", "Home", "End"):
+            return
+        self.picked = None
+        self.refresh()
+        if self.on_change:
+            self.on_change()
+
+    def _focused(self, event) -> None:
+        if self.open_on_focus and str(self.entry.cget("state")) == "normal":
+            self.refresh()
+
+    def refresh(self) -> None:
+        self.shown = search(self.text.get(), self.options(), self.MAX_ROWS)
+        only = len(self.shown) == 1 and self.shown[0].label == self.text.get()
+        if not self.shown or only:
+            self.close()
+            return
+        self._open()
+        self.listbox.delete(0, "end")
+        for o in self.shown:
+            self.listbox.insert("end", o.label)
+        self.listbox.configure(height=len(self.shown))
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(0)
+        self.listbox.activate(0)
+        self.popup.update_idletasks()
+        self.popup.geometry(f"{self.entry.winfo_width()}x{self.listbox.winfo_reqheight()}"
+                            f"+{self.entry.winfo_rootx()}+{self.entry.winfo_rooty() + self.entry.winfo_height()}")
+
+    def _open(self) -> None:
+        if self.popup is not None:
+            return
+        self.popup = tk.Toplevel(self)
+        self.popup.overrideredirect(True)
+        self.popup.attributes("-topmost", True)
+        self.listbox = tk.Listbox(self.popup, activestyle="none", exportselection=False, borderwidth=1, relief="solid")
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<ButtonRelease-1>", self._clicked)
+        self.winfo_toplevel().bind("<Configure>", self._window_moved, add="+")
+
+    def close(self) -> None:
+        if self.popup is not None:
+            self.popup.destroy()
+            self.popup = self.listbox = None
+
+    def _maybe_close(self) -> None:
+        if self.focus_get() is not self.entry:
+            self.close()
+
+    def _window_moved(self, event) -> None:
+        if event.widget is self.winfo_toplevel():
+            self.close()
+
+    def _move(self, step: int) -> str:
+        if self.popup is None:
+            self.refresh()
+            return "break"
+        sel = self.listbox.curselection()
+        i = max(0, min(len(self.shown) - 1, (sel[0] if sel else -1) + step))
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(i)
+        self.listbox.see(i)
+        return "break"
+
+    def _take(self, option: Option) -> None:
+        self.set(option)
+        self.close()
+        self.entry.icursor("end")
+        if self.on_pick:
+            self.on_pick()
+
+    def _clicked(self, event) -> None:
+        i = self.listbox.nearest(event.y)
+        if 0 <= i < len(self.shown):
+            self._take(self.shown[i])
+            self.entry.focus_set()
+
+    def _accept(self, event=None) -> str:
+        if self.popup is not None and self.listbox.curselection():
+            self._take(self.shown[self.listbox.curselection()[0]])
+        elif self.on_pick:
+            self.on_pick()
+        return "break"
+
+    def _accept_tab(self, event=None) -> None:
+        if self.popup is not None and self.text.get().strip() and self.listbox.curselection():
+            self._take(self.shown[self.listbox.curselection()[0]])
+        self.close()                                   # and Tab moves on as usual
 
 
 def other_autohaul() -> list[int]:
@@ -93,28 +236,37 @@ class Launcher:
 
         opts = ttk.Frame(frame, padding=(0, 8))
         opts.pack(fill="x")
-        ttk.Label(opts, text="Destination:").grid(row=0, column=0, sticky="w")
-        self.place = tk.StringVar(value=saved.get("place", ""))
-        self.place_entry = ttk.Entry(opts, textvariable=self.place, width=32)
-        self.place_entry.grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(opts, text="CITY or CITY:COMPANY (game tokens, e.g. berlin:nbfc)", foreground="#555").grid(
-            row=0, column=2, sticky="w")
-        ttk.Label(opts, text="Max speed (km/h):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        try:
+            self.index: PlaceIndex | None = PlaceIndex(map_dir(load_config()))
+        except (OSError, ValueError, KeyError):
+            self.index = None                     # no parsed map: "Drive to a place" can't work anyway
+        ttk.Label(opts, text="City:").grid(row=0, column=0, sticky="w")
+        self.city = SuggestEntry(opts, lambda: self.index.cities if self.index else [], on_change=self._city_changed,
+                                 on_pick=self._city_picked)
+        self.city.grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(opts, text="Company:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.company = SuggestEntry(opts, self._city_companies, open_on_focus=True, on_change=self._show_destination,
+                                    on_pick=self._show_destination)
+        self.company.grid(row=1, column=1, sticky="w", padx=6, pady=(4, 0))
+        self.destination = tk.StringVar()
+        ttk.Label(opts, textvariable=self.destination, foreground="#555").grid(row=1, column=2, sticky="w")
+        self._load_place(saved)
+        ttk.Label(opts, text="Max speed (km/h):").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.max_kmh = tk.IntVar(value=int(saved.get("max_kmh", 80)))
         ttk.Spinbox(opts, from_=20, to=90, increment=5, textvariable=self.max_kmh, width=6).grid(
-            row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+            row=2, column=1, sticky="w", padx=6, pady=(6, 0))
         self.record = tk.BooleanVar(value=bool(saved.get("record", True)))
         ttk.Checkbutton(opts, text="Record the drive (for fixing problems later)", variable=self.record).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.overlay = tk.BooleanVar(value=bool(saved.get("overlay", True)))
-        ttk.Checkbutton(opts, text="Show overlay on the game (what it reads, does, and why)", variable=self.overlay,
-                        command=self._overlay_changed).grid(row=3, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(opts, text="Show overlay on the game", variable=self.overlay,
+                        command=self._overlay_changed).grid(row=4, column=0, columnspan=3, sticky="w")
         self.corner = tk.StringVar(value=saved.get("corner", "top left"))
         ttk.Combobox(opts, textvariable=self.corner, values=list(CORNERS), state="readonly", width=12).grid(
-            row=3, column=2, sticky="w")
+            row=4, column=2, sticky="w")
         self.learn = tk.BooleanVar(value=bool(saved.get("learn", True)))
-        ttk.Checkbutton(opts, text="Learn while driving", variable=self.learn).grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Button(opts, text="Reset learning", command=self.reset_learning).grid(row=4, column=2, sticky="w")
+        ttk.Checkbutton(opts, text="Learn while driving", variable=self.learn).grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Button(opts, text="Reset learning", command=self.reset_learning).grid(row=5, column=2, sticky="w")
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(4, 8))
@@ -145,7 +297,7 @@ class Launcher:
     def _save(self, max_kmh: int) -> None:
         try:
             SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS.write_text(json.dumps({"mode": self.mode.get(), "place": self.place.get(),
+            SETTINGS.write_text(json.dumps({"mode": self.mode.get(), "place": self._spec(),
                                             "max_kmh": max_kmh, "record": self.record.get(),
                                             "overlay": self.overlay.get(), "corner": self.corner.get(),
                                             "learn": self.learn.get()}), encoding="utf-8")
@@ -153,15 +305,66 @@ class Launcher:
             pass
 
     def _mode_changed(self) -> None:
-        self.place_entry.configure(state="normal" if self.mode.get() == "to" else "disabled")
+        self.city.enable(self.mode.get() == "to")
+        self._city_changed()
+
+    # ------------------------------------------------------------- where to
+    def _city_companies(self) -> list[Option]:
+        city = self.city.choice()
+        return self.index.companies(city.token) if self.index and city else []
+
+    def _load_place(self, saved: dict) -> None:
+        """The last choice ("city" or "city:company", tokens as drive.py takes them)."""
+        token, _, company = str(saved.get("place", "")).strip().lower().partition(":")
+        if not self.index or not token:
+            return
+        city = next((c for c in self.index.cities if c.token == token), None)
+        self.city.set(city)
+        if city and company:
+            self.company.set(next((c for c in self.index.companies(city.token) if c.token == company), None))
+
+    def _city_changed(self) -> None:
+        city = self.city.choice()
+        self.company.enable(self.mode.get() == "to" and city is not None)
+        known = self._city_companies()
+        if self.company.text.get() and exact(self.company.text.get(), known) is None and self.company.picked is not None:
+            self.company.set(None)                # that company isn't in this city
+        self._show_destination()
+
+    def _city_picked(self) -> None:
+        self._city_changed()
+        if self.city.choice() is not None:
+            self.company.entry.focus_set()
+
+    def _show_destination(self) -> None:
+        city, typed = self.city.choice(), self.company.text.get().strip()
+        company = self.company.choice()
+        if city is None:
+            self.destination.set("")
+        elif typed and company is None:           # still typing, if there's something to suggest
+            matches = search(typed, self._city_companies())
+            self.destination.set("" if matches else f"no company like that in {city.name}")
+        elif company is not None:
+            self.destination.set(f"to {company.name} in {city.name}")
+        else:
+            n = len(self._city_companies())
+            self.destination.set(f"to the centre of {city.name} ({n} companies there)")
+
+    def _spec(self) -> str:
+        return place_spec(self.city.choice(), self.company.choice())
 
     # ------------------------------------------------------------- the drive process
     def start(self) -> None:
         if self.proc is not None:
             return
-        if self.mode.get() == "to" and not self.place.get().strip():
-            messagebox.showwarning("AutoHaul", "Type a destination first (CITY or CITY:COMPANY).")
-            return
+        if self.mode.get() == "to":
+            if self.city.choice() is None:
+                messagebox.showwarning("AutoHaul", "Choose a city from the list first.")
+                return
+            if self.company.text.get().strip() and self.company.choice() is None:
+                messagebox.showwarning("AutoHaul", f"There's no company like that in {self.city.choice().name}: choose one "
+                                                   "from the list, or leave the box empty for the city centre.")
+                return
         others = other_autohaul()
         if others:
             if not messagebox.askyesno("AutoHaul", f"AutoHaul is already running (process {', '.join(map(str, others))})."
@@ -176,7 +379,7 @@ class Launcher:
             max_kmh = 80
         self._save(max_kmh)
         args = [str(PYTHON), "-u", str(ROOT / "tools" / "drive.py")] + drive_args(
-            self.mode.get(), self.place.get(), max_kmh, self.record.get(), self.learn.get())
+            self.mode.get(), self._spec(), max_kmh, self.record.get(), self.learn.get())
         self._append(f"> {' '.join(args[2:])}\n")
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         try:

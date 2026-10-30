@@ -298,3 +298,10 @@ Routing stays fast: Rotterdam to Munich takes 0.2 s.
   - The router no longer uses `ab_toll_no` booth lanes in plazas that also have paying booths (111 paths).
   - A booth where 3 presses of activate took no payment is handed back as before, and saved in
     `logs/toll_booths_no_payment.json`. The router avoids it from then on.
+
+## Fixes from the drive of 2026-10-30
+
+- **Slowing at interchanges.** `inside_kmh` applied to every path of any junction with a crossing somewhere in it, for the path's whole length (up to 599 m): straight over a bridge or under one at 20 km/h, a third of the drive. It now applies within 30 m before to 10 m past a path's own conflicts, or along a path under a signal.
+- **Taking the side lane.** From an exit-only lane, a lane change (80 m) lost to going down a ramp, through the junction at the bottom and back up, hardly longer. Height change inside a junction now costs 12 m per metre, so it changes lanes and goes straight over. With no room to change, the ramp is still a way on.
+- **Sharp turns.** 6 % of the map's junction joins start behind the last path's end, 7 % to its side. Stitching added that point, drawing a hairpin the steering and curve speeds took for a tight turn the other way (curvature -0.21, +0.11, -0.08 on a radius of 12 m), and "sharp turn ahead" fired. Stitching now bridges only real gaps ahead. The radius check uses 6 m of road and allows 5 m, about full lock.
+- **"1.6 m off the lane centre"** needs 1 s of it below 29 km/h (0.2 s above; 3.5 m at once): a jump where two paths don't line up isn't the truck leaving the lane.

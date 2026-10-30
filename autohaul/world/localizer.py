@@ -90,6 +90,8 @@ class LaneTracker:
             c *= 0.6
         return c
 
+    join_skip_m = 1.0                  # where paths join, skip next-path points less than this ahead of the last one
+
     def path_ahead(self, distance: float, choose=None, behind: float = 0.0) -> np.ndarray:
         """Polyline (n, 2) from the truck's projection on its lane, `distance` metres forward.
 
@@ -118,6 +120,7 @@ class LaneTracker:
             acc += float(np.hypot(*(p - prev)))
             pts.append(p)
             prev = p
+            heading = float(lm.seg_rot[s])
             if s < last:
                 s += 1
                 continue
@@ -128,12 +131,19 @@ class LaneTracker:
             visited.add(lane)
             self.path_lanes.append(lane)
             s, last = lm.lane_first[lane], lm.lane_last[lane]
+            # Where a junction's paths join, the next one often starts behind this one's end, or to its side (6 % and 7 %
+            # of the map's joins, up to 2.5 m). Bridge only real gaps ahead, and skip what lies behind: a point back
+            # there draws a hairpin, which the steering and the curve speeds then take for a tight turn the other way
+            # (2026-10-30: curvature flipping -0.21, +0.11, -0.08 on a curve of radius 12 m, "sharp turn ahead").
+            u = np.array([math.cos(heading), math.sin(heading)])
             first = lm.seg[s, 0:2]
-            # bridge real gaps with a point, but not sub-metre ones: a tiny connector segment can point
-            # anywhere and would look like a hairpin to the curvature estimate
-            if np.hypot(*(first - prev)) > 1.0:
+            if float(np.dot(first - prev, u)) > 1.0:
                 pts.append(first)
                 prev = first
+            else:
+                while s < last and float(np.dot(lm.seg[s, 2:4] - prev, u)) < self.join_skip_m:
+                    s += 1
+            heading = float(lm.seg_rot[s])
         return np.array(pts)
 
     def _behind(self, start: np.ndarray, behind: float) -> list[np.ndarray]:

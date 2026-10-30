@@ -68,8 +68,14 @@ class AutopilotParams:
     hazard_lookahead_s: float = 8.0
     hazard_lookahead_m: float = 120.0
     # Phase 3 routing
-    route_min_turn_radius_m: float = 6.0      # planned turns on the route may be this tight (no trailer) ...
-    route_min_turn_radius_trailer_m: float = 6.0    # ... or with a trailer (the game's junction curves are made for
+    sharp_turn_window_m: float = 6.0          # a turn's radius is measured over this much road: one kinked piece of the map
+                                              # read "radius 6 m" on a curve of 10-17 m the driver took at 23 km/h
+    off_lane_slow_s: float = 1.0              # off the lane this long, under `off_lane_slow_ms`: a single jump in the map's
+    off_lane_fast_s: float = 0.2              # lanes isn't the truck leaving them (and this long at speed)
+    off_lane_slow_ms: float = 8.0
+    off_lane_hard_m: float = 3.5              # further off than this: at once
+    route_min_turn_radius_m: float = 5.0      # planned turns on the route may be this tight (full lock is ~4.9 m) ...
+    route_min_turn_radius_trailer_m: float = 5.0    # ... or with a trailer (the game's junction curves are made for
                                                     # AI trucks with trailers; 12 m, then 8 m handed back at town turns)
     intersection_lookahead_s: float = 8.0     # hand back this long before a junction with crossing paths
     intersection_lookahead_m: float = 100.0
@@ -155,6 +161,7 @@ class Autopilot:
         self.planner = SpeedPlanner(self.sp)
         self.caution = None                 # lane -> speed limit (m/s) or None: what autohaul.learn remembers
         self.teach = None                   # how the driver drove a place (autohaul.learn.Learner.bins)
+        self._off_for = 0.0
         self.safe_stop = False              # handing over at speed: hold the lane and brake to a stop, nothing else
         self.safe_stop_decel = 1.2          # m/s^2
         self.safe_stop_lateral_m = 3.5      # further off than this it can't be sure of the lane: let go at once
@@ -242,6 +249,7 @@ class Autopilot:
         self.lc = None
         self.join = None
         self.safe_stop = False
+        self._off_for = 0.0
         self.bias = self.tracker.bias = 0.0
         if self.gw:
             self.gw.reset()
@@ -393,6 +401,13 @@ class Autopilot:
         def applies(ds):
             return float(np.interp(ds, grid, mask))
         return line, applies
+
+    def _off_lane(self, off: float, v: float, dt: float) -> bool:
+        p = self.p
+        if self.safe_stop:
+            return abs(off) > self.safe_stop_lateral_m
+        self._off_for = self._off_for + dt if abs(off) > p.max_lateral_m else 0.0
+        return abs(off) > p.off_lane_hard_m or self._off_for >= (p.off_lane_slow_s if v < p.off_lane_slow_ms else p.off_lane_fast_s)
 
     def _changes_allowed(self) -> bool:
         """Automatic lane changes only where the map's lanes match the road (a big kept offset says they don't:
@@ -772,7 +787,7 @@ class Autopilot:
             out.servo_gain = getattr(self.servo, "gain", 0.0)
             if out.fault:
                 pass
-            elif abs(off_ref) > (self.safe_stop_lateral_m if self.safe_stop else self.p.max_lateral_m):
+            elif self._off_lane(off_ref, max(frame.speed, 0.0), dt):
                 out.fault = f"{abs(off_ref):.1f} m off the {'lane-change line' if moving_now else 'lane centre'}"
             elif self._low_conf > self.p.low_confidence_s and not self.safe_stop:
                 out.fault = f"lane match uncertain for {self._low_conf:.1f} s"
@@ -785,7 +800,7 @@ class Autopilot:
                 horizon = max(self.p.sharp_turn_lookahead_m, self.p.sharp_turn_lookahead_s * max(frame.speed, 0.0))
                 ss = np.arange(s0, min(s0 + horizon, path.length), 3.0)
                 if len(ss):
-                    k = np.abs(np.asarray(path.curvature(ss)))
+                    k = np.abs(np.asarray(path.curvature(ss, self.p.sharp_turn_window_m)))
                     i = int(np.argmax(k))
                     r_route = self.p.route_min_turn_radius_trailer_m if self._trailer else self.p.route_min_turn_radius_m
                     r_min = r_route if out.on_route else self.p.min_turn_radius_m

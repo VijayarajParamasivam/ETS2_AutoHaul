@@ -51,7 +51,7 @@ Double-click **`AutoHaul.bat`** (or a desktop shortcut to it). The launcher wind
 | Mode | |
 |---|---|
 | Job (full mission) | runs the active job: to the trailer, couples it, to the destination, quick park; fuel and rest stops |
-| Drive to a place | follows the route to a `CITY` or `CITY:COMPANY` you type |
+| Drive to a place | follows the route to a city and, if you choose one, a company there; both boxes suggest as you type |
 | Follow the road | lane keeping and speed, no route |
 | Steer only / Speed only | AutoHaul does one axis, you do the other |
 
