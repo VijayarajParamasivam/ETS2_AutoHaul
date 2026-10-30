@@ -4,6 +4,8 @@ driver's lane position is kept (map lanes can be ~1 m off), driving out of a yar
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -278,3 +280,93 @@ def test_a_long_way_round_is_not_taken_a_short_lane_change_is():
     assert not any("re-routed in lane" in n for n in notes)
     assert 0 in lanes and 2 in lanes and 4 not in lanes                # changed left, straight on
     assert fault is None or fault.startswith("destination reached")
+
+
+def test_with_a_trailer_the_cab_swings_out_in_a_tight_curve():
+    """2026-10-29: in roundabouts the trailer cut in over the kerb. With a trailer the cab now follows a line
+    outside the lane centre in tight curves (a share of the trailer's cut-in), and back on the straight."""
+    from types import SimpleNamespace
+    from autohaul.control.path import PathRef
+    pts = arc_polyline([(60, 0.0), (40, 1 / 15), (80, 0.0)])           # a 15 m right-hand curve
+    lm = build([(pts, KIND_ROAD, 1, 1)])
+    g = LaneGraph.build(lm, log=lambda *_: None)
+    ap = Autopilot(lm, GEOM, "relative", router=Router(lm, g))
+    ap.set_destination(*pts[-5])
+    assert ap._swing(1 / 15) < -0.8 and ap._swing(-1 / 15) > 0.8          # out to the left / to the right
+    assert ap._swing(1 / 100) == 0.0
+    path = PathRef(pts)
+    off = ap._with_trailer_swing(path, 0.0, None)
+    assert abs(off(30.0)[0]) < 0.05 and off(80.0)[0] < -0.8                # straight: centre; in the curve: out
+    sim = TruckSim(GEOM, x=5.0, y=0.0, rotation=0.0, speed=12 / 3.6)
+    assert ap.engage(sim.frame(15 / 3.6)) is None
+    lat, fault = [], None
+    for _ in range(int(40 / sim.p.dt)):
+        f = sim.frame(15 / 3.6)
+        f.trailers = [SimpleNamespace(connected=True)]
+        cmd, st = ap.step(f, [], sim.p.dt)
+        if st.fault:
+            fault = st.fault
+            break
+        pr = path.project(sim.s.x, sim.s.y)
+        if 72 < pr.s < 92:
+            lat.append(pr.lateral)
+        sim.step(cmd.steer, cmd.throttle, cmd.brake)
+    assert fault is None or fault.startswith("destination reached"), fault
+    assert lat and np.mean(lat) < -0.4                                      # the cab ran outside the centre
+
+
+
+def _paused_driver(moved_to=None):
+    """A Driver engaged at (100, 200), with just what the pause handling touches."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    import drive
+    d = drive.Driver.__new__(drive.Driver)
+    d.s = MagicMock()
+    d.s.safety.check.return_value = SimpleNamespace(ok=False, kind="paused", reason="game paused")
+    d.md = None
+    d.ap = MagicMock()
+    d.engaged = True
+    d.message = "ENGAGED"
+    d.notes = []
+    d.note = lambda **kw: d.notes.append(kw)
+    d.disengage = MagicMock()
+    d.feed_overlay = MagicMock()
+    d.print_status = MagicMock()
+    d._last_status = 1e18
+    d.status_period = 1.0
+    d.last_cmd = "the last command"
+    return d, SimpleNamespace(truck_placement=SimpleNamespace(x=100.0, z=200.0), paused=1)
+
+
+def test_a_game_pause_doesnt_hand_back():
+    """2026-10-30: paused, AutoHaul handed back; after the pause nobody steered, and at 78 km/h the truck hit the rail."""
+    d, f = _paused_driver()
+    d.hold_paused(f, None, [], 10.0)
+    d.disengage.assert_not_called()
+    assert d.engaged and d._paused_at == (100.0, 200.0) and "paused" in d.message
+    d.s.controls.commit.assert_called()                       # the heartbeat goes on
+    assert d.resume_after_pause(f) is True
+    d.disengage.assert_not_called()
+    assert d._paused_at is None and d.message == "ENGAGED"
+    d.s.safety.reset.assert_called()                          # keys pressed in the menus don't count
+    d.ap.servo.reset.assert_called()
+    assert d.last_cmd != "the last command"
+
+
+def test_a_truck_moved_during_a_pause_is_handed_back():
+    d, f = _paused_driver()
+    d.hold_paused(f, None, [], 10.0)
+    f.truck_placement.x = 5000.0                              # a save was loaded
+    assert d.resume_after_pause(f) is False
+    d.disengage.assert_called_once()
+
+
+def test_the_kill_key_works_during_a_pause():
+    from types import SimpleNamespace
+    d, f = _paused_driver()
+    d.s.safety.check.return_value = SimpleNamespace(ok=False, kind="kill", reason="kill key")
+    d.hold_paused(f, None, [], 10.0)
+    d.disengage.assert_called_once()

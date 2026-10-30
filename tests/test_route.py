@@ -189,6 +189,12 @@ def test_gap_check_sides_and_distances():
     assert check(_veh(1, -60.0, 4.5, 20.0)) is None                         # behind, same speed
     assert "behind" in check(_veh(1, -40.0, 4.5, 30.0))                     # behind and 10 m/s faster
     assert check(_veh(1, 0.0, 12.0, 20.0)) is None                          # two lanes over
+    # 2026-10-29: a wreck standing in the target lane 30 m ahead at 40 km/h: AutoHaul moved over towards it
+    slow = lambda gap: gap_check(Pose(0.0, 0.0, 0.0, 11.1, 0.0), -1, [_veh(1, gap, -4.5, 0.0)], 3.2, 3.5, p)  # noqa: E731
+    assert "stopped vehicle ahead" in slow(35.0) and "stopped vehicle ahead" in slow(140.0)
+    assert slow(200.0) is None
+    crawl = gap_check(Pose(0.0, 0.0, 0.0, 1.0, 0.0), -1, [_veh(1, 20.0, -4.5, 0.0)], 3.2, 3.5, p)
+    assert crawl is None                                                    # in a queue ourselves: fine
 
 
 def test_lane_change_waits_for_a_gap_then_makes_a_short_change(junction):

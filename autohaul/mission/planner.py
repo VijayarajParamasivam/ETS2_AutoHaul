@@ -30,8 +30,14 @@ from autohaul.world.services import ServicePoint, Services
 @dataclass
 class PlannerParams:
     reserve_km: float = 150.0          # game km of fuel always kept
+    arrive_min_share: float = 0.2      # ... and at least this share of the tank left on arrival: no ending a job
+                                       # near empty because the job itself was just covered (2026-10-30)
     rest_buffer_min: float = 60.0      # arrive at a place to sleep this long before the rest timer runs out
     corridor_m: float = 400.0          # world metres from the route (~8 game km)
+    fuel_corridors_m: tuple = (400.0, 800.0, 1600.0)   # no pump in reach: look further off the route (2026-10-30: 1 pump
+                                       # within 400 m on 465 game km, out of reach, so "none possible" from 165 l to 67 l)
+    fuel_detour_max_km: float = 40.0   # game km: a pump further out of the way isn't a good answer while wider looks may
+                                       # find a better one (an 8 km ahead one was a 306 km detour, with one at 280 km)
     min_ahead_m: float = 150.0         # stops closer than this are behind us by the time we could turn off
     branch_back_m: float = 900.0       # detours are measured from this far before the stop ...
     rejoin_m: float = 2500.0           # ... to this far after it, along the route
@@ -145,14 +151,15 @@ class StopPlanner:
         game_km = OPEN_ROAD_SCALE / 1000.0
         poly, starts = self._polyline(s.route, start_progress)
         total = s.route.length_m
-        reserve_l = p.reserve_km / game_km * fuel_m
-        need_l = total * fuel_m + reserve_l
-        drive_min = total * min_m
+        scaled = s.route.scaled_m or total
+        reserve_l = max(p.reserve_km / game_km * fuel_m, p.arrive_min_share * s.capacity_l)
+        need_l = scaled * fuel_m + reserve_l
+        drive_min = scaled * min_m
         fuel_needed = s.fuel_l < need_l
         rest_needed = s.next_rest is not None and s.next_rest - p.rest_buffer_min < drive_min
         rec: dict = {
             "game_time": round(s.game_time), "clock": clock(s.game_time),
-            "route_game_km": round(total * game_km), "drive": duration(drive_min),
+            "route_game_km": round(scaled * game_km), "drive": duration(drive_min),
             "fuel_l": round(s.fuel_l), "fuel_needed_l": round(need_l), "reserve_l": round(reserve_l),
             "litres_per_game_km": round(fuel_m / game_km, 3), "game_min_per_game_km": round(min_m / game_km, 3),
             "rest_left": None if s.next_rest is None else duration(s.next_rest),
@@ -165,10 +172,26 @@ class StopPlanner:
             return Plan([], self._ev(s, total, 0.0, 0.0, []), rec)
 
         fuel_c, sleep_c = [], []
+        known: dict[str, float | None] = {}                    # detours worked out already (they take a while)
         if fuel_needed:
-            for sp, along, off in self.services.along("fuel", poly, p.corridor_m):
-                if along >= p.min_ahead_m and along * fuel_m <= s.fuel_l - reserve_l / 2:
-                    fuel_c.append((sp, along))
+            margin = p.reserve_km / game_km * fuel_m / 2       # arrive at the pump with this left, if one allows it
+            longest = p.fuel_detour_max_km / game_km
+            seen: dict[str, tuple] = {}                        # site -> (candidate, detour)
+            for corridor in p.fuel_corridors_m:                # the narrowest that offers a pump with a sane detour
+                near = [(sp, along) for sp, along, off in self.services.along("fuel", poly, corridor)
+                        if along >= p.min_ahead_m and along * fuel_m <= 0.95 * s.fuel_l]
+                roomy = [c for c in near if c[1] * fuel_m <= s.fuel_l - margin]
+                for c in self._pick(roomy, cheap=True) + self._pick(near, cheap=True):
+                    if c[0].site not in seen:
+                        known[c[0].site] = d = self.detour(c[0], c[1], poly, starts, total)
+                        seen[c[0].site] = (c, d)
+                fair = [c for c, d in seen.values() if d is not None and d <= longest]
+                if fair:                                       # with margin at the pump, if any of them gives that
+                    fuel_c = [c for c in fair if c[1] * fuel_m <= s.fuel_l - margin] or fair
+                    break
+            else:                                              # nothing sane anywhere: the least bad one
+                ranked = sorted(((d, c) for c, d in seen.values() if d is not None), key=lambda x: x[0])
+                fuel_c = [c for _, c in ranked[:1]]
         if rest_needed:
             limit = s.next_rest - p.rest_buffer_min
             for sp, along, off in self.services.along("sleep", poly, p.corridor_m):
@@ -179,7 +202,7 @@ class StopPlanner:
         cands = []
         for kind, group in (("fuel", fuel_c), ("sleep", sleep_c)):
             for sp, along in group:
-                d = self.detour(sp, along, poly, starts, total)
+                d = known[sp.site] if kind == "fuel" and sp.site in known else self.detour(sp, along, poly, starts, total)
                 stop = None if d is None else self._stop(kind, sp, along, d, s, fuel_m, min_m)
                 cands.append(stop)
                 rec.setdefault("candidates", []).append({

@@ -139,7 +139,9 @@ class GiveWay:
         self.tolls = False                         # handle toll gates (pay with activate) instead of handing back
         self._toll: dict[int, dict] = {}           # junction -> toll gate progress
         self._dark: set[int] = set()               # junctions whose light shows no lamp: give way to everyone
+        self._item_lanes: dict[int, np.ndarray] = {}
         self._paid = False                         # the game reported a toll payment since the last gate
+        self.failed_toll_lane: int | None = None   # the booth path where pressing activate took no payment
 
     def toll_paid(self) -> None:
         """The game's `player.tollgate.paid` event."""
@@ -207,6 +209,22 @@ class GiveWay:
                 return f"{ctrl} {'here' if d <= 0 else f'in {d:.0f} m'} (not handled yet): take over"
         return None
 
+    def light_from_traffic(self, lane: int, item: int, parts: list) -> str | None:
+        """What the AI traffic says about our light (it obeys them): vehicles driving through on our signal
+        group's paths -> "green"; on another group's paths -> "red"; else None. Used when the lamps can't be seen
+        (2026-10-29: the light went out of view as the truck stopped, and it stood there for good)."""
+        lanes = self._item_lanes.get(item)
+        if lanes is None:
+            lanes = self._item_lanes[item] = np.flatnonzero(self.lm.lane_item == item)
+        ours = int(self.rules.sem_id[lane])
+        sid = {int(ln): int(self.rules.sem_id[ln]) for ln in lanes}
+        moving = [pt for pt in parts if pt.lane in sid and pt.speed > 3.0]
+        if any(sid[pt.lane] >= 0 and sid[pt.lane] != ours for pt in moving):
+            return "red"
+        if any(sid[pt.lane] == ours for pt in moving):
+            return "green"
+        return None
+
     def _gate_s(self, lane: int, item: int) -> float:
         """Metres along `lane` to the booth: the controlling semaphore nearest the lane, projected onto it."""
         lm = self.lm
@@ -245,6 +263,7 @@ class GiveWay:
                     gs["since"] += dt
                     if gs["stood"] > p.toll_settle_s and gs["since"] > p.toll_press_every_s:
                         if gs["presses"] >= p.toll_presses:
+                            self.failed_toll_lane = lane
                             out.handback = (f"toll gate: no payment after pressing activate {gs['presses']} times: "
                                             "pay yourself, then press / to go on")
                         else:
@@ -314,13 +333,14 @@ class GiveWay:
             mine = self.rules.priority(lane)
             if self.tolls and self.rules.control(lane, item) == "toll gate":
                 self._toll_gate(lane, item, s_start[k], s_front, v, dt, out, blocked)
-            dark = item in self._dark
+            dark = item in self._dark and (line_stop <= s_front - p.overshoot_m
+                                           or self.light_from_traffic(lane, item, parts) is None)
             if self.lights is not None and self.light(lane, item) and dark:
                 mine = -1                           # no light to obey: give way to every conflicting path
             elif self.lights is not None and self.light(lane, item) and line_stop <= s_front - p.overshoot_m:
                 green[item] = int(self.rules.sem_id[lane])   # inside the junction: entered on green (or amber)
             elif self.lights is not None and self.light(lane, item):
-                state = self.lights.state(lane, item)
+                state = self.lights.state(lane, item) or self.light_from_traffic(lane, item, parts)
                 stop = line_stop - self.lights.stop_back_m(lane, item)
                 if stop < s_front - p.overshoot_m:
                     # past the viewing point: standing, stay (closer, the lamps go out of sight above the cab);

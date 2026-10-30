@@ -58,6 +58,11 @@ class AutopilotParams:
     pedal_miss_s: float = 0.5             # fault when the game ignores AutoHaul's pedals this long ...
     ready_check: bool = True                  # refuse with the parking brake on or in reverse (off when the driver's
                                               # Keeper releases and shifts by itself)
+    trailer_swing: bool = True                # with a trailer, swing the cab out in tight curves ...
+    trailer_wheelbase_m: float = 7.7          # ... the trailer (kingpin to axles) cuts in by R - sqrt(R^2 - L^2)
+    swing_share: float = 0.5                  # ... the cab moves out by this share of it
+    swing_max_m: float = 1.2                  # ... at most (a lane is 4.5 m)
+    swing_from_radius_m: float = 45.0         # ... in curves tighter than this
     pedal_grace_s: float = 1.5            # ... checked from this long after engaging (the input device wakes up)
     hazard_radius_m: float = 60.0         # toll plaza icons sit within ~50 m of the booths
     hazard_lookahead_s: float = 8.0
@@ -148,6 +153,8 @@ class Autopilot:
         else:
             raise ValueError(f"unknown steering mode {steering_mode!r}")
         self.planner = SpeedPlanner(self.sp)
+        self.caution = None                 # lane -> speed limit (m/s) or None: what autohaul.learn remembers
+        self.caution_ahead_m = 150.0
         self.pedals = PedalController(self.sp)
         self._lost = 0.0
         self._low_conf = 0.0
@@ -169,6 +176,7 @@ class Autopilot:
         self.auto_lane_change = auto_lane_change
         self.lc: LaneChange | None = None
         self.bias = 0.0                           # kept offset from the mapped lane centre (+ right), see engage
+        self.entrances: set[int] = set()          # company entrance junctions: a yard is left through them
         self.join: Join | None = None             # driving out of a yard onto the lane map
         self._no_change_until = 0.0               # odometer: no automatic lane change before it (settling)
         self._odo = 0.0
@@ -261,13 +269,14 @@ class Autopilot:
         if why and self.lateral_on and self.longitudinal_on and frame.speed < self.p.join_max_speed_ms:
             # standing off the lanes (a company yard, a lay-by): drive out onto the nearest suitable lane
             no_go = getattr(self.router, "_no_go", None)
+            ent = self.entrances
             j = plan_join(self.lm, self.router, pose.x, pose.y, pose.rotation, self.destination, self.goal,
-                          no_go=no_go)
+                          no_go=no_go, prefer=lambda ln: int(self.lm.lane_item[ln]) in ent if ent else None)
             if j is not None:
                 self.join, self.route = j, j.route
                 self.tracker.reset()
                 return None
-            return f"{why}; and no way onto the lanes within 60 m"
+            return f"{why}; and no way out of here I can see (drive out of the yard yourself, then press /)"
         if why and (self.lateral_on or self.longitudinal_on):
             return why
         if self.lateral_on and self.p.keep_engage_offset and st is not None and abs(st.lateral) > 0.15:
@@ -316,6 +325,28 @@ class Autopilot:
                 if side:
                     return side
         return None
+
+    def _swing(self, k: float) -> float:
+        """Outward offset (+ right) for path curvature k (+ right turn): a share of the trailer's cut-in."""
+        r = 1.0 / max(abs(k), 1e-6)
+        if r >= self.p.swing_from_radius_m:
+            return 0.0
+        wb = self.p.trailer_wheelbase_m
+        cut = r - math.sqrt(max(r * r - wb * wb, 0.0))
+        return -math.copysign(min(self.p.swing_share * cut, self.p.swing_max_m), k)
+
+    def _with_trailer_swing(self, path, s0: float, base):
+        """`base` offset plus the trailer swing at each point ahead (2026-10-29: in roundabouts the trailer cut
+        in over the kerb while the cab followed the lane centre). Slope and curvature by finite differences."""
+        def sw(ds: float) -> float:
+            return self._swing(float(path.curvature(s0 + ds)))
+
+        def offset(ds):
+            y, dy, d2y = base(ds) if base is not None else (0.0, 0.0, 0.0)
+            h = 1.0
+            a, b, c = sw(ds - h), sw(ds), sw(ds + h)
+            return y + b, dy + (c - a) / (2 * h), d2y + (c - 2 * b + a) / (h * h)
+        return offset
 
     def _changes_allowed(self) -> bool:
         """Automatic lane changes only where the map's lanes match the road (a big kept offset says they don't:
@@ -398,6 +429,38 @@ class Autopilot:
                 return int(n)
         return None
 
+    def _stays_on_route(self, lane: int, target: int) -> bool:
+        """Does the neighbouring lane `target` keep running along the route until the change is due? Changing as
+        early as possible is only right if it does (2026-10-29: the route needed the left lane 3 km on, past an
+        exit on the right; AutoHaul moved left before the exit, missed it: 23 game km)."""
+        rt, g, lm, p = self.route, self.router.g, self.lm, self.lcp
+        i = rt.lane_index.get(lane)
+        if i is None:
+            return True
+        n, dist = target, 0.0
+        for j in range(i, len(rt.lanes) - 1):
+            if rt.changes[j + 1]:
+                return True
+            nxt = rt.lanes[j + 1]
+            ex, ey = lm.seg[lm.lane_last[nxt], 2:4]
+            rot = lm.seg_rot[lm.lane_last[nxt]]
+            best, best_d = None, p.parallel_m
+            for c in g.successors(n).tolist():
+                if c == nxt:
+                    return True                          # it merges into the route's lane
+                cx, cy = lm.seg[lm.lane_last[c], 2:4]
+                d = math.hypot(cx - ex, cy - ey)
+                turn = math.atan2(math.sin(lm.seg_rot[lm.lane_last[c]] - rot), math.cos(lm.seg_rot[lm.lane_last[c]] - rot))
+                if d <= best_d and abs(turn) < 0.5:
+                    best, best_d = c, d
+            if best is None:
+                return False
+            n = best
+            dist += float(g.length[nxt])
+            if dist > 4000.0:
+                return True
+        return True
+
     def _lane_change_step(self, st, pose, traffic, out: Status) -> str | None:
         """Signal, wait for a gap, then move into the lane the route needs (only when AutoHaul steers).
         The change is made as early as possible: into the neighbouring lane of whatever road piece the truck is
@@ -412,6 +475,9 @@ class Autopilot:
                 return None
             side, deadline = up
             target = self._neighbour(st.lane, side)
+            if target is not None and not self._stays_on_route(st.lane, target):
+                self.lc = None                  # that lane leaves the route before the change is due: not yet
+                return None
             if lc is None:
                 if target is None:
                     return None                 # no lane on that side here yet: wait for one
@@ -454,6 +520,16 @@ class Autopilot:
             if not self._changes_allowed():
                 why = why or "waiting: just joined the road / the map's lanes look off here"
                 lc.waiting = why
+            if why and deadline > max(p.signal_wait_m, p.signal_wait_s * v):
+                # no gap and no hurry: nothing to signal yet
+                if not lc.signalling or self._sim_clock - lc.signal_on >= p.signal_keep_s:
+                    lc.signalling = False
+                    out.indicator = None
+                    lc.started = self._sim_clock
+            elif not lc.signalling:
+                lc.signalling, lc.signal_on = True, self._sim_clock
+                lc.started = self._sim_clock
+                signalled = False
             if not why and signalled and self._neighbour(st.lane, lc.side) is not None:
                 hit = [h for h in self.lm.nearest(pose.x, pose.y, pose.rotation, max_dist=8.0, k=8) if h.lane == lc.target]
                 if not hit:
@@ -615,6 +691,13 @@ class Autopilot:
                 return y + bias, dy, d2y
         elif bias:
             offset = lambda ds: (bias, 0.0, 0.0)                      # noqa: E731
+        swing_now = 0.0
+        if self._trailer and self.p.trailer_swing:
+            offset = self._with_trailer_swing(path, s_truck, offset)
+            swing_now = self._swing(float(path.curvature(s_truck)))
+            off_ref -= swing_now                    # the swing is meant: not an error
+            out.lateral = off_ref
+        self.tracker.bias = self.bias + swing_now   # the lane match expects the truck there
         lat = self.lat.step(pose, path, dt, measured_steer_left(frame, self.geom), steer_rate=rate, offset=offset)
         out.ctrl_lateral, out.kappa_ff, out.curve_ratio = lat.lateral, lat.kappa_ff, lat.ratio
         target = max(-self.p.max_steer_units, min(self.p.max_steer_units, lat.steer_left / self.geom.rad_per_unit))
@@ -688,6 +771,13 @@ class Autopilot:
             target_v, reason = limit, "limit" if frame.navigation_speed_limit > 0.5 else "no limit known"
             if self.sp.max_speed_kmh * KMH <= target_v:
                 reason = "max speed"
+            if self.caution is not None:
+                for lane, start in zip(self.tracker.path_lanes, self._path_starts(st)):
+                    if start - s0 > self.caution_ahead_m:
+                        break
+                    cap = self.caution(lane)
+                    if cap is not None and cap < target_v:
+                        target_v, reason = cap, "you've had to take over near here before"
             if v_ahead < target_v:
                 target_v = v_ahead
                 reason = {"curve": f"curve in {d_ahead:.0f} m", "give way": f"give way line in {d_ahead:.0f} m",

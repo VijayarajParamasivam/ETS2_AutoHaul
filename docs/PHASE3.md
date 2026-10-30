@@ -277,3 +277,24 @@ Routing stays fast: Rotterdam to Munich takes 0.2 s.
     press doesn't pay there, it hands back after 3 tries.
   - Wide plazas are crossed at the 20 km/h junction speed.
   - Border checks, barriers and weigh stations still hand back.
+
+## Fixes from the drives of 2026-10-29
+- **Roundabouts and tight turns with a trailer:** the cab followed the lane centre and the trailer cut in over
+  the kerb. A semi-trailer cuts in by about R - sqrt(R^2 - L^2), about 2 m on a 15 m roundabout.
+  - In curves tighter than 45 m with a trailer, the cab now runs outside the centre by half of that, at most
+    1.2 m, and back on the straight.
+  - The lane checks allow for the swing.
+- **Lamp colours:** a lit lamp must be near full brightness and saturation (green about (40, 248, 35), red about
+  (250, 30, 27)). Sunlit leaves, red roofs and orange signs in the search box could pass the looser limits, so a
+  false green could send the truck through a red.
+  - A patch of one colour over 25 lamps' areas counts as a sign, not lamps.
+- **A light out of view** (it stood at a light that had gone out of sight, then handed back): the game's AI
+  obeys the lights, so AutoHaul reads them from the traffic.
+  - Vehicles moving on another signal group's paths: red.
+  - Vehicles moving on our group's paths: green.
+  - With no lamp and no telling traffic, it gives way to everyone (a signal for the AI only, a head beside the
+    cab, or lights off).
+- **Toll booths with nowhere to pay:** the map doesn't say which booths have a payment machine.
+  - The router no longer uses `ab_toll_no` booth lanes in plazas that also have paying booths (111 paths).
+  - A booth where 3 presses of activate took no payment is handed back as before, and saved in
+    `logs/toll_booths_no_payment.json`. The router avoids it from then on.

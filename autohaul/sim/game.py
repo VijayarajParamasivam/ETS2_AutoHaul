@@ -9,6 +9,10 @@
   sleep    in a parking place (within `parking_m`, standing): `activate` opens the sleep screen, `selectfcs`
            sleeps: the clock jumps `sleep_min`, the rest timer resets to `rest_after_sleep_min`
   deliver  `deliver()` emits job.delivered as the game would once the driver has parked the trailer
+  gears    `gearreverse` / `geardrive` select reverse / drive (standing only, as the automatic gearbox does)
+  couple   with `trailer_pose` (a TrailerPose, uncoupled): `attach` couples it when the fifth wheel
+           (`hook_back_m` behind the truck's origin) is within `couple_m` of the kingpin and the truck faces
+           within `couple_deg` of the trailer's heading; the job's cargo counts as loaded from then on
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ class SimGame:
                  scale: float = 19.0, fuel_l_per_m: float = 0.33 * 19 / 1000, pumps=(), parkings=(),
                  refuel_mode: str = "hold", refuel_lps: float = 15.0, sleep_min: float = 540.0,
                  rest_after_sleep_min: float = 660.0, pump_m: float = 4.0, parking_m: float = 35.0,
-                 quick_park: bool = True):
+                 quick_park: bool = True, trailer: bool | None = None, trailer_pose=None,
+                 hook_back_m: float = 1.57, kingpin_ahead_m: float = 5.0, couple_m: float = 1.2,
+                 couple_deg: float = 15.0):
         self.sim = sim
         self.job = dict(job) if job else None
         self.fuel, self.capacity = fuel_l, capacity_l
@@ -37,6 +43,10 @@ class SimGame:
         self.sleep_min, self.rest_after = sleep_min, rest_after_sleep_min
         self.pump_m, self.parking_m = pump_m, parking_m
         self.quick_park = quick_park                # the game's quick park answers `quickpark` at the depots
+        self.trailer = bool(job and job.get("loaded")) if trailer is None else trailer   # coupled
+        self.trailer_pose = trailer_pose
+        self.hook_back, self.kingpin_ahead = hook_back_m, kingpin_ahead_m
+        self.couple_m, self.couple_deg = couple_m, couple_deg
         self.held: set[str] = set()
         self._pumping = False
         self.flowing = False
@@ -51,6 +61,7 @@ class SimGame:
     def frame(self, speed_limit: float = 0.0) -> SimpleNamespace:
         f = self.sim.frame(speed_limit)
         f.fuel = self.fuel
+        f.trailers = [SimpleNamespace(connected=self.trailer)]
         f.fuel_average_consumption = self.fuel_l_per_m * 1000 / self.scale
         f.fuel_range = self.fuel / max(f.fuel_average_consumption, 1e-6)
         f.game_time = int(self.game_time)
@@ -99,17 +110,40 @@ class SimGame:
                 self.sleep_screen = True
                 self.log.append((self.sim.t, "sleep screen"))
             elif name == "quickpark" and standing and self.job is not None and self.quick_park:
-                if self.job.get("loaded"):
+                if self.trailer and self.job.get("loaded"):
                     self.log.append((self.sim.t, "quick park: delivered"))
                     self.deliver()
+                    self.trailer = False
                 else:
-                    self.job["loaded"] = True
+                    self.job["loaded"] = self.trailer = True
                     self.log.append((self.sim.t, "quick park: trailer attached"))
+            elif name == "gearreverse" and standing:
+                self.sim.s.gear = -1
+            elif name == "geardrive" and standing:
+                self.sim.s.gear = 1
+            elif name == "attach" and not self.trailer and self.trailer_pose is not None and self._at_kingpin():
+                self.trailer = True
+                if self.job is not None:
+                    self.job["loaded"] = True
+                self.log.append((self.sim.t, "trailer coupled"))
             elif name == "selectfcs" and self.sleep_screen:
                 self.sleep_screen = False
                 self.game_time += self.sleep_min
                 self.next_rest = self.rest_after
                 self.log.append((self.sim.t, f"slept {self.sleep_min / 60:.0f} h"))
+
+    def hook_error(self) -> tuple[float, float]:
+        """The fifth wheel's distance from the kingpin (m) and the heading difference (deg)."""
+        t, s = self.trailer_pose, self.sim.s
+        kx = t.x + self.kingpin_ahead * math.cos(t.rotation)
+        ky = t.y + self.kingpin_ahead * math.sin(t.rotation)
+        hx, hy = s.x - self.hook_back * math.cos(s.rotation), s.y - self.hook_back * math.sin(s.rotation)
+        dh = math.degrees(math.atan2(math.sin(s.rotation - t.rotation), math.cos(s.rotation - t.rotation)))
+        return math.hypot(hx - kx, hy - ky), dh
+
+    def _at_kingpin(self) -> bool:
+        d, dh = self.hook_error()
+        return d <= self.couple_m and abs(dh) <= self.couple_deg
 
     def _near(self, points, radius) -> bool:
         x, y = self.sim.s.x, self.sim.s.y
