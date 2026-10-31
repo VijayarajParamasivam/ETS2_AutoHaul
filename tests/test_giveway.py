@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pytest
 
-from autohaul.control.giveway import time_to
+from autohaul.control.giveway import GiveWay, GiveWayParams, _Part, time_to
 from autohaul.control.path import PathRef
 from autohaul.control.vehicle import TruckGeometry
 from autohaul.drive.autopilot import Autopilot
@@ -508,3 +508,54 @@ def test_lamp_colours_need_lamp_brightness():
     lamp_red = np.array([[[250, 30, 27]] * 10], dtype=np.uint8)
     assert classify(lamp_green)["green"] == 10 and classify(leaves)["green"] == 0
     assert classify(lamp_red)["red"] == 10 and classify(roof)["red"] == 0
+
+
+def _gw_at_merge():
+    lm, g, r, *_ = make_t_junction()
+    j = Junctions(lm)
+    return GiveWay(lm, g, j, r, GiveWayParams()), j.conflicts(4)[0]
+
+
+def _car(c, front, speed=11.0):
+    """A car on the other path's approach, its front `front` metres from the conflict point."""
+    return [_Part(1, c.other, c.s_other - (front + 2.5), speed, 5.0)]
+
+
+def test_at_a_merge_the_truck_doesnt_wait_for_a_car_far_away():
+    gw, c = _gw_at_merge()
+    assert c.kind == "merge"
+    d = c.s_mine                                    # standing at the line
+    assert gw._threat(c, True, d, 7.0, 0.0, _car(c, 150), set(), 7) is None      # (it used to stand for this one)
+    assert "giving way" in gw._threat(c, True, d, 7.0, 0.0, _car(c, 40), set(), 7)
+
+
+def test_a_trailer_needs_a_bigger_gap_than_the_truck_alone():
+    gw, c = _gw_at_merge()
+
+    def first_gap(own_len):
+        return next(front for front in range(10, 300, 5)
+                    if gw._threat(c, True, c.s_mine + 10.0, own_len, 0.0, _car(c, front), set(), 7) is None)
+    assert first_gap(20.0) > first_gap(7.0)
+
+
+def test_past_the_line_only_a_car_about_to_arrive_stops_the_truck_in_the_turn():
+    gw, c = _gw_at_merge()
+    d, v = c.s_mine - c.zone_mine + 6.0, 1.5
+
+    def first_gap(inside):
+        return next(front for front in range(10, 300, 5)
+                    if gw._threat(c, True, d, 7.0, v, _car(c, front), set(), 7, inside=inside) is None)
+    assert first_gap(True) < first_gap(False) - 10
+    assert "giving way" in gw._threat(c, True, d, 7.0, v, _car(c, 20), set(), 7, inside=True)
+
+
+def test_a_crossing_still_wants_the_truck_clear_of_it(crossroads):
+    lm, g, *_ = crossroads
+    j = Junctions(lm)
+    r = _rules(lm, 6, 12)
+    gw = GiveWay(lm, g, j, r, GiveWayParams())
+    c = j.conflicts(1)[0]
+    assert c.kind == "cross"
+    # clearing it takes the truck about 8 s, and a car 90 m out gets there in about 6
+    car = [_Part(1, c.other, c.s_other - 92.5, 14.0, 5.0)]
+    assert "giving way" in gw._threat(c, True, c.s_mine, 7.0, 0.0, car, set(), 7)

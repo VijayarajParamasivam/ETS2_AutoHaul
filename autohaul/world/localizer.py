@@ -8,11 +8,17 @@ clearly closer, so it doesn't flicker between adjacent lanes or across junction 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from autohaul.world.lanemap import LaneHit, LaneMap
+
+
+def _still(x: float) -> float:
+    """How much of a step is left to ease across at share `x` of the way: 1 to 0, smoothly."""
+    x = min(max(x, 0.0), 1.0)
+    return 1.0 - x * x * (3.0 - 2.0 * x)
 
 
 @dataclass
@@ -36,10 +42,13 @@ class LaneTracker:
         self.path_lanes: list[int] = []      # lanes covered by the last path_ahead() call, in order
         self.path_back = 0.0                 # metres of that path behind the truck's projection
         self.bias = 0.0                      # where the truck is meant to be relative to the lane centre (+ right)
+        self._step = np.zeros(2)             # the sideways step at the join into the tracked lane, still being eased across
+        self._ease_m = 0.0                   # ... over this much of the lane (0: none)
 
     def reset(self) -> None:
         self.state = None
         self.prev_lane = None
+        self._step, self._ease_m = np.zeros(2), 0.0
 
     def update(self, x: float, y: float, rotation: float, prefer: list[int] | None = None,
                force: int | None = None, force_max_dist: float = 7.5) -> LaneState | None:
@@ -53,6 +62,7 @@ class LaneTracker:
                     if switched:
                         cont = h.lane in {lane for lane, _ in self.lm.successors(self.state.lane)}
                         self.prev_lane = self.state.lane if cont else None
+                        self._step, self._ease_m = np.zeros(2), 0.0
                     # the lane is known (a deliberate change), so being between two lanes is not ambiguity;
                     # the autopilot checks the truck against the eased line instead
                     self.state = LaneState(h.lane, h.segment, h.t, h.lateral, h.heading_err, 0.9, switched)
@@ -74,11 +84,50 @@ class LaneTracker:
         conf = self._confidence(chosen, hits, known, self.bias)
         if self.state is None or switched:
             self.prev_lane = None
+            self._step, self._ease_m = np.zeros(2), 0.0
         elif chosen.lane != self.state.lane:
             self.prev_lane = self.state.lane
+            self._cross_join(self.state.lane, chosen.lane)
+        lateral = chosen.lateral - self._eased_off(chosen.lane, chosen.segment, chosen.t)
+        if lateral != chosen.lateral:          # against the eased line the truck follows: the step is the map's, not its own
+            chosen = replace(chosen, lateral=lateral)
+            conf = self._confidence(chosen, hits, known, self.bias)
         self.state = LaneState(chosen.lane, chosen.segment, chosen.t, chosen.lateral, chosen.heading_err, conf,
                                switched and self.state is not None)
         return self.state
+
+    def _join(self, end: np.ndarray, heading: float, s: int) -> tuple[float, np.ndarray, float]:
+        """The join from a path ending at `end` with `heading` into the path starting at segment `s`:
+        how far ahead that start lies, the step to its side, and how much road to ease across the step over."""
+        first = self.lm.seg[s, 0:2]
+        u = np.array([math.cos(heading), math.sin(heading)])
+        ahead = float(np.dot(first - end, u))
+        step = (first - end) - ahead * u
+        size = float(np.hypot(*step))
+        return ahead, step, (max(self.join_ease_m, self.join_ease_per_m * size) if size > 0.1 else 0.0)
+
+    def _along(self, s: int, lane: int) -> float:
+        """Metres along `lane` to the start of its segment `s`."""
+        first = self.lm.lane_first[lane]
+        return float(np.sum(self.lm.seg_len[first:s]))
+
+    def _cross_join(self, old: int, new: int) -> None:
+        """Keep the eased line the truck was following as it crosses from `old` into `new`."""
+        lm = self.lm
+        last = lm.lane_last[old]
+        end = lm.seg[last, 2:4].copy()
+        if self._ease_m > 0.0:                 # (a short lane: the last step may not be eased out yet)
+            end = end - self._step * _still((self._along(last, old) + float(lm.seg_len[last])) / self._ease_m)
+        _, self._step, self._ease_m = self._join(end, float(lm.seg_rot[last]), lm.lane_first[new])
+
+    def _eased_off(self, lane: int, s: int, t: float) -> float:
+        """How far right of the lane's own centre the eased line runs at segment `s` (negative: left)."""
+        if self._ease_m <= 0.0:
+            return 0.0
+        lm = self.lm
+        along = self._along(s, lane) + t * float(lm.seg_len[s])
+        rot = float(lm.seg_rot[s])
+        return float(self._step[0] * math.sin(rot) - self._step[1] * math.cos(rot)) * _still(along / self._ease_m)
 
     @staticmethod
     def _confidence(h: LaneHit, hits: list[LaneHit], known: bool = False, bias: float = 0.0) -> float:
@@ -91,6 +140,8 @@ class LaneTracker:
         return c
 
     join_skip_m = 1.0                  # where paths join, skip next-path points less than this ahead of the last one
+    join_ease_m = 8.0                  # ease across a sideways step over at least this much road ...
+    join_ease_per_m = 16.0             # ... or this many metres per metre of step
 
     def path_ahead(self, distance: float, choose=None, behind: float = 0.0) -> np.ndarray:
         """Polyline (n, 2) from the truck's projection on its lane, `distance` metres forward.
@@ -106,17 +157,24 @@ class LaneTracker:
             return np.empty((0, 2))
         lm, st = self.lm, self.state
         seg = lm.seg[st.segment]
+        lane, s = st.lane, st.segment
+        step, ease_m = self._step, self._ease_m
+        eased = self._along(s, lane) if ease_m > 0.0 else 0.0
         start = seg[0:2] + st.t * (seg[2:4] - seg[0:2])
+        if ease_m > 0.0:                       # the line stays where it was when the truck crosses the join
+            start = start - step * _still((eased + st.t * float(lm.seg_len[s])) / ease_m)
         back = self._behind(start, behind) if behind > 0 else []
         pts = back + [start]
         acc = 0.0
-        lane, s = st.lane, st.segment
         last = lm.lane_last[lane]
         prev = start
         visited = {lane}
         self.path_lanes = [lane]
         while acc < distance:
             p = lm.seg[s, 2:4]
+            if eased < ease_m:                 # still easing across a sideways step at the last join
+                eased += float(lm.seg_len[s])
+                p = p - step * _still(eased / ease_m)
             acc += float(np.hypot(*(p - prev)))
             pts.append(p)
             prev = p
@@ -135,13 +193,18 @@ class LaneTracker:
             # of the map's joins, up to 2.5 m). Bridge only real gaps ahead, and skip what lies behind: a point back
             # there draws a hairpin, which the steering and the curve speeds then take for a tight turn the other way
             # (2026-10-30: curvature flipping -0.21, +0.11, -0.08 on a curve of radius 12 m, "sharp turn ahead").
+            # A step to the side (7 % of joins, up to 2.5 m) is eased across over the next metres: as a jump it reads as a
+            # sharp turn the wrong way (2026-10-30: 0.96 m, curvature +0.24 in a left turn, the wheel steered right).
             u = np.array([math.cos(heading), math.sin(heading)])
             first = lm.seg[s, 0:2]
-            if float(np.dot(first - prev, u)) > 1.0:
-                pts.append(first)
-                prev = first
+            ahead, step, ease_m = self._join(prev, heading, s)
+            eased = 0.0
+            if ahead > 1.0:
+                prev = first - step
+                pts.append(prev)
             else:
                 while s < last and float(np.dot(lm.seg[s, 2:4] - prev, u)) < self.join_skip_m:
+                    eased += float(lm.seg_len[s])
                     s += 1
             heading = float(lm.seg_rot[s])
         return np.array(pts)
@@ -153,6 +216,8 @@ class LaneTracker:
         lane, s = st.lane, st.segment
         while acc < behind:
             p = lm.seg[s, 0:2]
+            if lane == st.lane and self._ease_m > 0.0:     # the line eased across the step at this lane's join
+                p = p - self._step * _still(self._along(s, lane) / self._ease_m)
             d = float(np.hypot(*(p - prev)))
             if d > 1e-6:
                 out.append(p)

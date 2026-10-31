@@ -21,6 +21,10 @@ class Projection:
 
 
 class PathRef:
+    # Only real slivers: a tight junction curve is made of pieces under 0.5 m (19 % of the map's junction pieces), and
+    # leaving those out took the whole curve away (2026-10-30: radius 10 m read as straight, feedforward 0 mid-turn).
+    sliver_m = 0.15
+
     def __init__(self, pts: np.ndarray, curvature_window: float = 12.0):
         pts = np.asarray(pts, dtype=float)
         keep = np.concatenate([[True], np.hypot(*np.diff(pts, axis=0).T) > 1e-3])
@@ -35,7 +39,8 @@ class PathRef:
         self._window = curvature_window
         # unwrapped heading at segment midpoints, for curvature by windowed differences; very short
         # segments (joins between lanes) have unreliable directions and are left out
-        use = self.seg_len >= 0.5
+        use = self.seg_len >= self.sliver_m
+        use[0] = self.seg_len[0] >= 0.5        # (the stub from the truck's projection: its midpoint says little)
         if not use.any():
             use[:] = True
         self._mid_s = ((self.s[:-1] + self.s[1:]) / 2)[use]

@@ -49,7 +49,12 @@ from autohaul.world.rules import JunctionRules
 @dataclass
 class GiveWayParams:
     look_back_m: float = 150.0          # follow the other path's lanes back this far for approaching vehicles
-    yield_margin_s: float = 3.0         # a vehicle with right of way must arrive this long after we've cleared
+    yield_margin_s: float = 3.0         # crossing: a vehicle with right of way must arrive this long after we've cleared
+    merge_enter_s: float = 3.0          # merging: it arrives this long after we've entered its lane (it can slow for us) ...
+    merge_clear_s: float = 1.0          # ... or this long after we've cleared, whichever comes first
+    inside_margin_s: float = 1.0        # past the line: stop in the middle of the junction only for one arriving before
+                                        # we're in the zone (plus this), not for one far away
+    inside_after_m: float = 2.0         # the front bumper is past the line, in the junction, by this much
     priority_margin_s: float = 1.0
     occupied_m: float = 3.0             # a vehicle this close to the conflict point is in the way (at least)
     clear_m: float = 3.0                # we've cleared the conflict point when our rear is this far past it
@@ -58,7 +63,9 @@ class GiveWayParams:
     stopped_ignore_m: float = 15.0      # vehicles standing still farther out than this are waiting themselves
     other_stop_decel: float = 3.0       # m/s^2: a vehicle that would need harder braking to stop at its give-way
                                         # line isn't going to give way
-    own_accel: float = 0.5              # m/s^2, the truck pulling away
+    own_accel: float = 1.2              # m/s^2, the truck pulling away (medians of 56 real pull-aways, 2026-10-30)
+    own_accel_trailer: float = 0.75     # ... with a trailer
+    trailer_len_m: float = 12.0         # longer than this, front bumper to rear: it has a trailer
     junction_speed: float = 20 / 3.6    # m/s, the truck's speed through the junction (for its clearing time)
     approach_kmh: float = 15.0          # speed at a give-way line, so the truck can still stop
     inside_kmh: float = 20.0            # top speed where paths conflict inside an intersection (or under a signal)
@@ -411,7 +418,8 @@ class GiveWay:
                 if give and line_stop > s_front - 0.3 and item not in yielding:
                     yielding.add(item)
                     out.points.append((line_stop, p.approach_kmh / 3.6, "give way"))
-                why = self._threat(c, give, s_c - s_front, own_len, v, parts, on_path, item)
+                why = self._threat(c, give, s_c - s_front, own_len, v, parts, on_path, item,
+                                   s_front - line_stop > p.inside_after_m)
                 if why is None:
                     continue
                 # where to wait: at the line, or (already past it) short of the conflict zone (where the two
@@ -439,13 +447,23 @@ class GiveWay:
         return out
 
     def _threat(self, c: Conflict, give: bool, d_conf: float, own_len: float, v: float, parts: list[_Part],
-                on_path: set[int], item: int) -> str | None:
-        """Why the conflict point `d_conf` metres ahead of our front bumper isn't clear, or None."""
+                on_path: set[int], item: int, inside: bool = False) -> str | None:
+        """Why the conflict point `d_conf` metres ahead of our front bumper isn't clear, or None.
+        `inside`: already past the line, where standing in the turn is worse than going on."""
         p = self.p
         lead_in = max(p.occupied_m, c.s_mine - c.zone_mine)       # the zone starts this far before the point
         their_in = max(p.occupied_m, c.s_other - c.zone_other)
-        t_in = time_to(d_conf - lead_in, v, p.own_accel, max(v, p.junction_speed))
-        t_out = time_to(d_conf + own_len + p.clear_m, v, p.own_accel, max(v, p.junction_speed))
+        accel = p.own_accel_trailer if own_len > p.trailer_len_m else p.own_accel
+        t_in = time_to(d_conf - lead_in, v, accel, max(v, p.junction_speed))
+        t_out = time_to(d_conf + own_len + p.clear_m, v, accel, max(v, p.junction_speed))
+        # how long after now a vehicle with right of way may arrive (2026-10-30: at a merge, a truck that cleared in 13 s
+        # by the old sum stood at the line for a car 150 m out, and stopped again halfway round the turn for another)
+        if inside:
+            arrive_after = t_in + p.inside_margin_s
+        elif c.kind == "merge":
+            arrive_after = min(t_in + p.merge_enter_s, t_out + p.merge_clear_s)
+        else:
+            arrive_after = t_out + p.yield_margin_s
         app = self.approach(c.other, c.s_other)
         length = self.g.length
         what = "crossing" if c.kind == "cross" else "merging"
@@ -463,7 +481,7 @@ class GiveWay:
                 if part.speed < 0.5 and front > p.stopped_ignore_m:
                     continue
                 t_arr = time_to(front - their_in, part.speed, p.other_accel, max(part.speed, p.other_vmax))
-                if t_arr < t_out + p.yield_margin_s:
+                if t_arr < arrive_after:
                     return f"giving way to vehicle {part.vid} on a {what} path ({front:.0f} m out)"
             else:
                 to_line = front - c.s_other             # its front to the start of its junction path

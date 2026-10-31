@@ -11,6 +11,8 @@ import pytest
 from autohaul.world.lanemap import (CACHE_VERSION, KIND_PREFAB, KIND_ROAD, LANE_WIDTH, LaneMap, calibrate_looks, fit_lanes,
                                     heading_to_rotation, hermite, offset_polyline, quat_forward_rotation, rule_layout)
 from autohaul.world.localizer import LaneTracker
+from autohaul.control.path import PathRef
+from autohaul.sim.course import arc_polyline
 
 
 def lanes_to_map(lanes: list[np.ndarray]) -> LaneMap:
@@ -222,3 +224,42 @@ def test_router_counts_city_metres_like_the_game():
     city = Router(lm, g, weight=w).route(0, 0.0, (790.0, 0.0))
     assert 1 in plain.lanes and 2 not in plain.lanes
     assert 2 in city.lanes and 3 in city.lanes and city.length_m > plain.length_m + 250   # lengths stay metres
+
+
+def _stepped_join():
+    """Two junction paths; the second starts 0.96 m to the left of the first one's end (as 322379 -> 322389 does)."""
+    a = arc_polyline([(40, 0.0)], step=1.0)
+    b = arc_polyline([(40, 0.0)], x=40.07, y=-0.96, step=1.0)
+    from tests.test_route import build
+    return build([(a, KIND_PREFAB, 7, 0), (b, KIND_PREFAB, 7, 1)])
+
+
+def test_a_sideways_step_between_paths_is_eased_not_jumped():
+    tr = LaneTracker(_stepped_join())
+    tr.update(30.0, 0.0, 0.0)
+    path = PathRef(tr.path_ahead(45.0))
+    s = np.arange(0.0, path.length, 1.0)
+    assert np.abs(np.asarray(path.curvature(s, 3.0))).max() < 0.04      # a jump reads as a sharp turn the wrong way
+    ends = path.project(69.0, -0.96)
+    assert abs(ends.lateral) < 0.02                                     # and it does end up on the second path
+
+
+def test_the_eased_line_stays_put_as_the_truck_crosses_the_join():
+    tr = LaneTracker(_stepped_join())
+    tr.update(30.0, 0.0, 0.0)
+    line = PathRef(tr.path_ahead(45.0))
+    i = np.searchsorted(line.pts[:, 0], 45.0)
+    y = float(line.pts[i, 1])
+    st = tr.update(float(line.pts[i, 0]), y, 0.0)
+    assert st.lane == 1 and abs(st.lateral) < 0.05 and st.confidence > 0.7   # against the line, not the map's step
+    after = tr.path_ahead(10.0, behind=8.0)
+    assert np.hypot(*(after[0] - after[1])) < 2.0
+    assert max(abs(line.project(float(x), float(z)).lateral) for x, z in after if x > 30.0) < 0.05
+    st = tr.update(70.0, -0.96, 0.0)
+    assert abs(st.lateral) < 0.02                                       # eased out: the path's own centre again
+
+
+def test_a_tight_curve_of_short_pieces_keeps_its_curvature():
+    path = PathRef(arc_polyline([(20.0, -1 / 10)], step=0.45))
+    assert abs(float(path.curvature(10.0, 3.0)) + 0.1) < 0.005
+    assert abs(path.mean_curvature(8.0, 12.0) + 0.1) < 0.005
