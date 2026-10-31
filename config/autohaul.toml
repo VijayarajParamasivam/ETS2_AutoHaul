@@ -2,8 +2,9 @@
 # Put machine-specific overrides in config/local.toml (git-ignored); it is merged on top of this file.
 
 [game]
-install_dir = 'C:\Games\Euro Truck Simulator 2'
-home_dir = '%USERPROFILE%\OneDrive\Documents\Euro Truck Simulator 2'
+# Elsewhere on your machine? Set these in config/local.toml.
+install_dir = 'C:\Program Files (x86)\Steam\steamapps\common\Euro Truck Simulator 2'
+home_dir = '%USERPROFILE%\Documents\Euro Truck Simulator 2'
 expected_version = "1.53.2.1"
 
 [paths]

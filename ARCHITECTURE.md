@@ -13,19 +13,18 @@ Scope: Euro Truck Simulator 2 **1.53.2.1**, **single-player only**, Windows. Aut
 
 ---
 
-## 1. Your installation (verified 2026-10-19)
+## 1. The installation it was built on (verified 2026-10-19)
 
 | Item | Found |
 |---|---|
-| Game binary | `C:\Games\Euro Truck Simulator 2\bin\win_x64\eurotrucks2.exe` |
+| Game binary | `<game folder>\bin\win_x64\eurotrucks2.exe` |
 | Version | `1.53.2.1` (`game.log.txt`: "Loaded pack set version 1.53.2.1 created at 1733317869" = 2024-12-04) |
-| Profile/home dir | `%USERPROFILE%\OneDrive\Documents\Euro Truck Simulator 2` (one local, offline profile) |
+| Profile/home dir | `%USERPROFILE%\Documents\Euro Truck Simulator 2` (one local, offline profile) |
 | Map DLC packs mounted | `dlc_east`, `dlc_north`, `dlc_fr`, `dlc_it`, `dlc_balt`, `dlc_iberia`, `dlc_balkan_w`, `dlc_balkan_e`, `dlc_greece` (+ trailer/truck/paint DLCs) |
 | Mods | none (0 local, 0 workshop) |
 | SDK plugins folder | `bin\win_x64\plugins\` **does not exist yet** (no telemetry plugin installed) |
 | Input devices | Keyboard, mouse, `Controller (Xbox360 For Windows)` (XInput) |
 | Display | 1920×1080, **exclusive fullscreen** (`r_fullscreen 1`) |
-| PC | i5-13420H (8C/16T), 16 GB RAM, **RTX 4050 Laptop 6 GB** (driver 592.82) |
 | Toolchain | Visual Studio Build Tools 2026 (MSVC 14.51, Windows SDK 10.0.26100) ✓, Python 3.12.10 + 3.14.6 ✓, Node.js 24.18 / npm 11.16 ✓, git ✓, GitHub CLI ✓, CMake + Ninja installed in the project venv (`.venv`), **.NET SDK missing** (only needed for the optional TruckLib cross-check) |
 
 ### 1.1 Scope
@@ -236,7 +235,7 @@ Python 3.12 is the default: it has the widest CUDA/ML wheel support. You have bo
 Reads the 1.53-pin blocks: `Local\ETS2LATraffic` (2600 B: 20 × vehicle + 2 trailers), `Local\ETS2LASemaphore` (1040 B: 20 × lights/gates), `Local\ETS2LARoute` (80 000 B: 5000 × `node_uid, distance_to_end, time_to_end`), `Local\ETS2LACameraProps` (36 B). The layouts are defined once in `native/spec/ets2la_c328dc38.toml`, so a later pin bump only changes that file. Each block is validated: change detection (these blocks carry no timestamp, so "stale" means unchanged for N frames while the truck moves), and sanity checks (positions near the truck, quaternions normalized, route distance decreasing). If the plugin is missing or stale, `world` marks those sources **unavailable** and the confidence gate (§5.11) limits what AutoHaul may do: highway ACC only with vision, no urban driving.
 
 ### 5.3 Map database (`world/mapdb.py`, `tools/extract_map.py`)
-- Offline: run the **pinned TruckSim Maps parser (`eca70d70` + our small patch for nav-curve flags, semaphore IDs and fuel prices)** on `C:\Games\Euro Truck Simulator 2` → JSON → our **SQLite + numpy** cache in `data/map/1.53.2.1/`. Node 24 is installed. If the parser's native addon won't build on Node 24, `tools/extract_map.py` uses a portable Node 22 LTS (no system install). Contents: road segments with lane centerlines, prefab **AI nav curves** with connectivity (in-node → out-node, lane index, traffic-rule flags), semaphores, signs where available, POIs (fuel stations, rest areas/truck stops with sleep, parking, company depots with parking spots, tolls, weigh stations, ferries/trains, borders).
+- Offline: run the **pinned TruckSim Maps parser (`eca70d70` + our small patch for nav-curve flags, semaphore IDs and fuel prices)** on the game folder → JSON → our **SQLite + numpy** cache in `data/map/1.53.2.1/`. Node 24 is installed. If the parser's native addon won't build on Node 24, `tools/extract_map.py` uses a portable Node 22 LTS (no system install). Contents: road segments with lane centerlines, prefab **AI nav curves** with connectivity (in-node → out-node, lane index, traffic-rule flags), semaphores, signs where available, POIs (fuel stations, rest areas/truck stops with sleep, parking, company depots with parking spots, tolls, weigh stations, ferries/trains, borders).
 - Runtime: R-tree spatial index, lane graph (`networkx`, or a compact custom graph for speed).
 
 ### 5.4 Localization and route (`world/localization.py`, `world/route.py`)
